@@ -125,8 +125,10 @@ export default {
             }
 
             let textSch = `📋 *JADWAL KULIAH MAHASISWA (${acc.nim}):*\n\n`;
-            schData.data.slice(0, 4).forEach((j, idx) => {
-              textSch += `${idx + 1}. *${j.matakuliah || j.nama_mata_kuliah}*\n`;
+            schData.data.forEach((j, idx) => {
+              const namaMatkul = j.nama || j.matakuliah || j.nama_mata_kuliah || "Mata Kuliah";
+              const sks = j.sks ? ` (${j.sks} SKS)` : "";
+              textSch += `${idx + 1}. *${namaMatkul}*${sks}\n`;
               textSch += `   ⏰ ${j.hari || '-'}, ${j.jam || j.waktu || '-'} (Ruang: ${j.ruang || '-'})\n\n`;
             });
 
