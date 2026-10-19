@@ -49,8 +49,8 @@ export default {
           await answerCallback(botToken, query.id, "Sedang memproses presensi ke MyBest...");
 
           try {
-            // Panggil backend UBSI-API untuk submit presensi sesi aktif
-            const res = await fetch(`${backendUrl}/v1/elearning/presence/submit`, {
+            // Endpoint resmi backend: POST /v1/elearning/presence (token opsional via query)
+            const res = await fetch(`${backendUrl}/v1/elearning/presence`, {
               method: 'POST',
               headers: {
                 'X-API-Key': apiKey,
@@ -62,9 +62,14 @@ export default {
             });
             const presData = await res.json();
 
-            if (presData.success) {
-              const mkName = presData.data?.matakuliah || "Kuliah Hari Ini";
-              const dosen = presData.data?.dosen || "-";
+            // PENTING: backend membungkus hasil di dalam "data".
+            // Outer success selalu true (HTTP 200) walau sesi tidak aktif,
+            // jadi status sukses/gagal yang ASLI ada di presData.data.success
+            const r = presData.data || {};
+
+            if (presData.success && r.success) {
+              const mkName = r.matakuliah || "Kuliah Hari Ini";
+              const dosen = r.dosen || "-";
 
               // 1. Notif Ringkas di Topik Grup
               await sendTelegram(
@@ -89,7 +94,7 @@ export default {
                 );
               }
             } else {
-              const msgErr = presData.error?.message || presData.data?.message || "Tidak ada sesi kuliah yang sedang membuka presensi saat ini.";
+              const msgErr = r.message || r.status || presData.error?.message || "Tidak ada sesi kuliah yang sedang membuka presensi saat ini.";
               await sendTelegram(
                 botToken,
                 chatId,
@@ -207,11 +212,24 @@ async function sendTelegram(token, chatId, text, threadId = null, replyMarkup = 
   if (threadId) payload.message_thread_id = threadId;
   if (replyMarkup) payload.reply_markup = replyMarkup;
 
-  return await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+  const resp = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
   });
+  const j = await resp.json().catch(() => ({}));
+
+  // Fallback: kalau Markdown gagal karena karakter aneh (nama matkul/dosen
+  // mengandung _ atau *), kirim ulang sebagai teks polos
+  if (!j.ok && payload.parse_mode) {
+    delete payload.parse_mode;
+    return await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  }
+  return resp;
 }
 
 async function answerCallback(token, queryId, text) {
