@@ -129,14 +129,6 @@ export default {
               simText += "\n💡 Semakin banyak SKS ditempuh dengan grade A, semakin cepat IPK naik.";
             }
 
-            // 1. Notif privasi di topik (NILAI TIDAK DIBOCORKAN DI GRUP)
-            await sendTelegram(
-              botToken,
-              chatId,
-              `📊 *Analisis selesai, ${userName}!* Hasil lengkap dikirim ke DM Bot Master. 🔒`,
-              threadId
-            );
-
             // 2. Laporan lengkap ke DM via Bot Master
             if (!masterBotToken) return new Response('OK', { status: 200 });
 
@@ -162,6 +154,13 @@ export default {
                 botToken,
                 chatId,
                 `⚠️ *${userName}*, gagal mengirim laporan ke DM. Buka chat *Bot Master* dan tekan /start dulu, lalu klik tombol analisis lagi!`,
+                threadId
+              );
+            } else {
+              await sendTelegram(
+                botToken,
+                chatId,
+                `📊 *Laporan analisis ${userName} terkirim ke DM Bot Master.* 🔒`,
                 threadId
               );
             }
