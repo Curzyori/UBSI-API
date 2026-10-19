@@ -30,6 +30,13 @@ export default {
         const chatId = query.message.chat.id;
         const threadId = query.message.message_thread_id || null;
 
+        // ── KUNCI SATPAM TOPIK STATISTIK (Thread ID: 2) ──
+        const isGroup = query.message.chat.type === 'group' || query.message.chat.type === 'supergroup';
+        if (isGroup && Number(threadId) !== 2) {
+          await answerCallback(botToken, query.id, "Fitur ini hanya aktif di Topik Statistik Mahasiswa!");
+          return new Response('OK', { status: 200 });
+        }
+
         const acc = await getStudentAccount(supabaseUrl, supabaseKey, userId);
 
         if (!acc) {
@@ -131,6 +138,12 @@ export default {
         const chatId = msg.chat.id;
         const threadId = msg.message_thread_id || null;
         const text = (msg.text || '').trim();
+
+        // ── KUNCI SATPAM TOPIK STATISTIK (Thread ID: 2) ──
+        const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+        if (isGroup && Number(threadId) !== 2) {
+          return new Response('Ignored out-of-topic message', { status: 200 });
+        }
 
         if (text.startsWith('/stats') || text.startsWith('/nilai') || text.startsWith('/menu')) {
           const menuText = 

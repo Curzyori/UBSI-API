@@ -25,6 +25,13 @@ export default {
       const threadId = msg.message_thread_id || null;
       const text = (msg.text || '').trim();
 
+      // ── KUNCI SATPAM TOPIK GUDANG MATERI (Thread ID: 7) ──
+      // Jika di grup publik dan bukan di topik Gudang Materi, abaikan pesan
+      const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+      if (isGroup && Number(threadId) !== 7) {
+        return new Response('Ignored out-of-topic message', { status: 200 });
+      }
+
       // ── 1. CARI BUKU PERPUSTAKAAN OPAC (/buku <keyword>) ──
       if (text.startsWith('/buku')) {
         const query = text.replace(/^\/buku(@\w+)?/, '').trim();
