@@ -44,7 +44,7 @@ def extract_client_ip(request: Request) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if not settings.API_KEY and not os.getenv("PYTEST_CURRENT_TEST"):
-        settings.API_KEY = "usrc_secret_2026"
+        raise RuntimeError("API_KEY wajib disetel di environment variables!")
 
     try:
         from app.channels_db import init_db
