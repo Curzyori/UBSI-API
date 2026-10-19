@@ -1,12 +1,12 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
-    HOST: str = "127.0.0.1"
-    PORT: int = 8300
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
     REDIS_URL: str = "redis://127.0.0.1:6379/2"
 
-    API_KEY: str = ""
-    ALLOWED_ORIGINS: str = "https://ubsi-api.muaraai.com,http://localhost:3000"
+    API_KEY: str = "usrc_secret_2026"
+    ALLOWED_ORIGINS: str = "*"
     TRUSTED_PROXIES: str = "127.0.0.1"
     ROOT_PATH: str = ""
 
