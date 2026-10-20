@@ -337,3 +337,27 @@ def _bearer_token(request: Request) -> str:
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
     return ""
+
+
+class EncryptAccountRequest(BaseModel):
+    elearning_pass: str = Field(..., description="Password Elearning")
+    studentv2_pass: str = Field(..., description="Password SIAKAD")
+
+
+@router.post("/encrypt-account")
+async def encrypt_account(req: EncryptAccountRequest, request: Request):
+    if not getattr(request.state, "is_master", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=error_response(
+                code="FORBIDDEN",
+                message="Endpoint enkripsi akun khusus Master Key",
+                module="auth"
+            )
+        )
+    from app.api_keys_db import encrypt_student_password
+    return success_response(data={
+        "encrypted_elearning": encrypt_student_password(req.elearning_pass),
+        "encrypted_siakad": encrypt_student_password(req.studentv2_pass)
+    })
+

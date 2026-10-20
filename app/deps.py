@@ -3,6 +3,7 @@ import os
 from fastapi import Request, HTTPException, status
 from app.config import Settings, settings
 from app.envelope import error_response
+from app.api_keys_db import decrypt_student_password
 
 def require_studentv2_creds(
     request: Request = None,  # type: ignore[assignment]
@@ -18,14 +19,14 @@ def require_studentv2_creds(
         nim = getattr(request.state, "nim", None)
         pwd = getattr(request.state, "studentv2_pass", None)
         if nim and pwd:
-            return str(nim), str(pwd)
+            return str(nim), decrypt_student_password(str(pwd))
 
     # Tier 2: Manual Developer Header Override (untuk pengujian & otomasi)
     if request is not None and hasattr(request, "headers"):
         h_nim = request.headers.get("x-studentv2-nim") or request.headers.get("x-nim")
         h_pass = request.headers.get("x-studentv2-pass") or request.headers.get("x-pass")
         if h_nim and h_pass:
-            return h_nim.strip(), h_pass.strip()
+            return h_nim.strip(), decrypt_student_password(h_pass.strip())
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -50,14 +51,14 @@ def require_elearning_creds(
         nim = getattr(request.state, "nim", None)
         pwd = getattr(request.state, "elearning_pass", None)
         if nim and pwd:
-            return str(nim), str(pwd)
+            return str(nim), decrypt_student_password(str(pwd))
 
     # Tier 2: Manual Developer Header Override (untuk pengujian & otomasi)
     if request is not None and hasattr(request, "headers"):
         h_nim = request.headers.get("x-elearning-nim") or request.headers.get("x-nim")
         h_pass = request.headers.get("x-elearning-pass") or request.headers.get("x-pass")
         if h_nim and h_pass:
-            return h_nim.strip(), h_pass.strip()
+            return h_nim.strip(), decrypt_student_password(h_pass.strip())
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,

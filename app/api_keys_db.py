@@ -62,6 +62,23 @@ def _get_fernet() -> Fernet:
     return Fernet(key)
 
 
+def encrypt_student_password(plain_password: str) -> str:
+    if not plain_password:
+        return ""
+    f = _get_fernet()
+    return f.encrypt(plain_password.encode("utf-8")).decode("utf-8")
+
+
+def decrypt_student_password(encrypted_password: str) -> str:
+    if not encrypted_password or not encrypted_password.startswith("gAAAAA"):
+        return encrypted_password
+    try:
+        f = _get_fernet()
+        return f.decrypt(encrypted_password.encode("utf-8")).decode("utf-8")
+    except Exception:
+        return encrypted_password
+
+
 def _connect() -> sqlite3.Connection:
     import os
 

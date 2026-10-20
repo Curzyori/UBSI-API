@@ -50,7 +50,7 @@ export default {
 
           try {
             // Endpoint resmi backend: POST /v1/elearning/presence (token opsional via query)
-            const res = await fetch(`${backendUrl}/v1/elearning/presence`, {
+            const presRes = await safeFetchJson(`${backendUrl}/v1/elearning/presence`, {
               method: 'POST',
               headers: {
                 'X-API-Key': apiKey,
@@ -60,7 +60,14 @@ export default {
                 'X-Pass': acc.encrypted_password,
               }
             });
-            const presData = await res.json();
+
+            if (!presRes.ok && (!presRes.data || !presRes.data.success)) {
+              const errMsg = presRes.data?.error?.message || (presRes.status === 502 ? "Server backend/kampus sedang sibuk (502). Coba sesaat lagi." : `Gagal menghubungi server (${presRes.status})`);
+              await sendTelegram(botToken, chatId, `⚠️ *Gagal Absen (${userName}):*\n${errMsg}`, threadId);
+              return new Response('OK', { status: 200 });
+            }
+
+            const presData = presRes.data || {};
 
             // PENTING: backend membungkus hasil di dalam "data".
             // Outer success selalu true (HTTP 200) walau sesi tidak aktif,
@@ -113,16 +120,24 @@ export default {
           await answerCallback(botToken, query.id, "Mengambil jadwal kuliah...");
 
           try {
-            const schRes = await fetch(`${backendUrl}/v1/studentv2/schedule`, {
+            const siakadPass = acc.siakad_password || acc.encrypted_password;
+            const schRes = await safeFetchJson(`${backendUrl}/v1/studentv2/schedule`, {
               headers: {
                 'X-API-Key': apiKey,
                 'X-StudentV2-NIM': acc.nim,
-                'X-StudentV2-Pass': acc.encrypted_password,
+                'X-StudentV2-Pass': siakadPass,
                 'X-Nim': acc.nim,
-                'X-Pass': acc.encrypted_password,
+                'X-Pass': siakadPass,
               }
             });
-            const schData = await schRes.json();
+
+            if (!schRes.ok && (!schRes.data || !schRes.data.success)) {
+              const errMsg = schRes.data?.error?.message || (schRes.status === 502 ? "Portal SIAKAD kampus sedang lambat/down (502). Coba sesaat lagi." : `Gagal mengambil jadwal (${schRes.status})`);
+              await sendTelegram(botToken, chatId, `⚠️ *Gagal Jadwal (${userName}):*\n${errMsg}`, threadId);
+              return new Response('OK', { status: 200 });
+            }
+
+            const schData = schRes.data || {};
 
             if (!schData.success || !schData.data || schData.data.length === 0) {
               await sendTelegram(botToken, chatId, `📋 Tidak ada jadwal kuliah terdaftar untuk NIM *${acc.nim}*.`, threadId);
@@ -238,4 +253,18 @@ async function answerCallback(token, queryId, text) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ callback_query_id: queryId, text: text })
   });
+}
+
+async function safeFetchJson(url, options) {
+  try {
+    const res = await fetch(url, options);
+    const text = await res.text();
+    try {
+      return { ok: res.ok, status: res.status, data: JSON.parse(text) };
+    } catch (_) {
+      return { ok: false, status: res.status, raw: text };
+    }
+  } catch (err) {
+    return { ok: false, status: 0, error: err.message };
+  }
 }
