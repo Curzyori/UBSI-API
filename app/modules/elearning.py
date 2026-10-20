@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import statistics
+import urllib.parse
 from typing import Any, Optional
 
 import httpx
@@ -326,6 +327,17 @@ def parse_materials(html: str) -> list[dict[str, Any]]:
     page = Adaptor(html)
     materials = []
 
+    def _abs(href: str) -> str:
+        # Absolutisasi URL file: parser MyBest kerap menghasilkan path relatif
+        # yang kemudian ditolak pemeriksa anti-SSRF di endpoint download.
+        href = (href or "").strip()
+        if not href:
+            return href
+        if href.startswith("http://") or href.startswith("https://"):
+            return href
+        base = "https://elearning.bsi.ac.id/"
+        return urllib.parse.urljoin(base, href)
+
     # Check table rows first
     tables = page.css("table")
     if tables:
@@ -340,7 +352,7 @@ def parse_materials(html: str) -> list[dict[str, Any]]:
                     "kelas": cols[2],
                     "judul": cols[3],
                     "deskripsi": cols[4],
-                    "file_url": links[0] if links else None,
+                    "file_url": _abs(links[0]) if links else None,
                     "update": cols[6] if len(cols) > 6 else None,
                 })
 
@@ -349,17 +361,18 @@ def parse_materials(html: str) -> list[dict[str, Any]]:
     for a in page.css("a"):
         h = a.attrib.get("href", "").strip()
         if h and any(ext in h.lower() for ext in [".zip", ".pdf", ".rar", "silabus"]):
-            if h not in seen_urls:
-                seen_urls.add(h)
+            h_abs = _abs(h)
+            if h_abs not in seen_urls:
+                seen_urls.add(h_abs)
                 title = a.text.strip() or ("Silabus / Modul" if "silabus" in h else "Bahan Ajar")
-                item_id = hashlib.sha256(h.encode()).hexdigest()[:12]
+                item_id = hashlib.sha256(h_abs.encode()).hexdigest()[:12]
                 materials.append({
                     "id": item_id,
                     "kode": None,
                     "kelas": None,
                     "judul": title,
                     "deskripsi": "Berkas silabus / modul pembelajaran",
-                    "file_url": h,
+                    "file_url": h_abs,
                     "update": None,
                 })
 
@@ -1407,3 +1420,71 @@ async def download_assignment_file(
                 module="elearning",
             ),
         )
+
+
+# ── Soal Map: short_id ↔ URL file soal (untuk callback_data Telegram ≤64 byte) ──
+
+class SoalMapRequest(BaseModel):
+    urls: list[str] = Field(..., min_length=1, max_length=20, description="Daftar URL file soal MyBest")
+
+
+@router.post("/soal-map")
+async def map_soal_urls(body: SoalMapRequest):
+    """Simpan mapping short_id → URL file soal di Redis (TTL 24 jam).
+
+    Worker Telegram butuh ini karena callback_data maks 64 byte — URL panjang
+    tidak muat di tombol inline.
+    """
+    from app.cache import cache
+
+    mapping: dict[str, str] = {}
+    try:
+        client = await cache.get_client()
+    except Exception:
+        client = None
+
+    for u in body.urls:
+        if not isinstance(u, str) or len(u) > 500:
+            continue
+        low = u.lower()
+        if "bsi.ac.id" not in low:
+            continue
+        sid = hashlib.sha256(u.encode()).hexdigest()[:10]
+        if client is not None:
+            try:
+                await client.set(f"ubsi:soalmap:{sid}", u, ex=86400)
+            except Exception:
+                pass
+        mapping[u] = sid
+
+    return success_response(data={"map": mapping})
+
+
+@router.get("/soal-map/{sid}")
+async def get_soal_url(sid: str):
+    """Ambil kembali URL file soal dari short_id."""
+    from app.cache import cache
+
+    if not re.fullmatch(r"[a-f0-9]{10}", sid):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=error_response(code="INVALID_ID", message="Format short_id tidak valid", module="elearning"),
+        )
+
+    try:
+        client = await cache.get_client()
+        url = await client.get(f"ubsi:soalmap:{sid}")
+    except Exception:
+        url = None
+
+    if not url:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=error_response(
+                code="SOAL_EXPIRED",
+                message="Daftar tugas sudah kedaluwarsa, ketik /tugas untuk memuat ulang.",
+                module="elearning",
+            ),
+        )
+
+    return success_response(data={"url": url})

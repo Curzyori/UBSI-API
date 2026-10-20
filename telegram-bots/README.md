@@ -45,6 +45,10 @@ Menggunakan **Arsitektur 4 Bot (3 Bot Pekerja Spesialis di Topik Grup + 1 Bot Ma
   - `/buku <kata kunci>`: Pencarian katalog OPAC Perpustakaan BSI beserta tautan baca.
   - `/cari <kata kunci>`: Pencarian skripsi, tugas akhir, dan riset di EPrints Repository BSI.
   - `/jurnal`: Menampilkan direktori e-journal resmi kampus.
+  - `/materi <kata kunci>`: Unduh slide/PDF materi MyBest (dikirim sebagai file + mirror DATACENTER).
+  - `/tugas`: Daftar tugas aktif (nama matkul, deadline, status pengumpulan) + tombol unduh soal.
+  - `/kumpul <token_tugas> <link_gdrive> [catatan]`: Pengumpulan tugas via Google Drive
+    (wajib link dengan akses *"Anyone with the link"*; tersimpan di tabel `ubsi_task_submissions`).
 
 ### ⚡ 3. Bot Absensi MyBest (`worker-absen.js`)
 - **Lokasi:** Topik *E-Learning & Absen*
