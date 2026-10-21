@@ -83,6 +83,11 @@ export default {
             });
             await answerCallback(botToken, query.id, "Dibatalkan.");
             await sendTelegram(botToken, chatId, "❌ *Pengumpulan dibatalkan.* Tidak ada data yang tersimpan.", threadId);
+            await ghostLog(supabaseUrl, supabaseKey, datacenterChatId, botToken, {
+              bot: "gudang", chat_id: chatId, thread_id: threadId,
+              user_id: userId, user_name: userName, nim: acc ? acc.nim : null,
+              command: "kumpul_no", detail: `batal konfirmasi submission #${subId}`, outcome: "cancelled"
+            });
             return new Response('OK', { status: 200 });
           }
 
@@ -106,6 +111,31 @@ export default {
           });
 
           await answerCallback(botToken, query.id, "Tugas terkumpul!");
+
+          // Resi anti-rekayasa (kegagalan tabel tidak memutus alur)
+          const resiCode = await saveReceipt(supabaseUrl, supabaseKey, {
+            code: genCode("KMP"), type: "kumpul",
+            user_id: row.telegram_user_id || userId, nim: row.nim,
+            full_name: row.full_name || userName,
+            summary: `Kumpul "${row.judul_tugas || row.token_tugas}" ${row.is_late ? "(TERLAMBAT)" : "(tepat waktu)"}`,
+            ref_id: Number(subId),
+          });
+
+          // Transaksi berhasil → hapus pesan preview + command asli
+          const pvRes = await safeFetchJson(
+            `${supabaseUrl}/rest/v1/ubsi_ephemeral_msgs?kind=eq.kumpul_preview&ref_id=eq.${subId}&select=*`,
+            { headers: { 'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}` } }
+          );
+          const pvRow = Array.isArray(pvRes.data) ? pvRes.data[0] : null;
+          if (pvRow) {
+            await deleteMessage(botToken, chatId, pvRow.message_id);
+            if (pvRow.cmd_msg_id) await deleteMessage(botToken, chatId, pvRow.cmd_msg_id);
+            await fetch(`${supabaseUrl}/rest/v1/ubsi_ephemeral_msgs?id=eq.${pvRow.id}`, {
+              method: 'DELETE',
+              headers: { 'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}` }
+            }).catch(() => {});
+          }
+
           await sendTelegram(
             botToken, chatId,
             `🎉 *TUGAS BERHASIL DIKUMPULKAN (GOOGLE DRIVE)*\n` +
@@ -116,8 +146,10 @@ export default {
             `🔗 *Link:* ${row.drive_link}\n` +
             (row.catatan ? `💬 *Catatan:* ${row.catatan}\n` : "") +
             (row.is_late ? `⚠️ *Status: TERLAMBAT (melewati deadline)*\n` : `✅ *Status: TEPAT WAKTU*\n`) +
+            (resiCode ? `🧾 *Resi:* \`${resiCode}\` _(verifikasi: /cek ${resiCode} ke Bot Master)_\n` : "") +
             `\n_Bukti pengumpulan tercatat permanen di sistem USRC._ 🤍`,
-            threadId
+            threadId,
+            { inline_keyboard: [[{ text: "🔄 Cek Tugas Lagi", callback_data: "re_tugas" }]] }
           );
 
           // Arsip ke DATACENTER USRC
@@ -131,9 +163,33 @@ export default {
               `🔗 ${row.drive_link}\n` +
               `💬 ${row.catatan || '-'}\n` +
               `⏰ ${row.is_late ? 'TERLAMBAT' : 'TEPAT WAKTU'}\n` +
+              `🧾 Resi: ${resiCode || '-'}\n` +
               `📅 ${new Date().toISOString()}`
             ).catch(() => {});
           }
+
+          await ghostLog(supabaseUrl, supabaseKey, datacenterChatId, botToken, {
+            bot: "gudang", chat_id: chatId, thread_id: threadId,
+            user_id: row.telegram_user_id || userId, user_name: row.full_name || userName,
+            nim: row.nim, command: "kumpul_ok",
+            detail: `${row.judul_tugas || row.token_tugas} — resi ${resiCode || "-"}`,
+            outcome: "success"
+          });
+          return new Response('OK', { status: 200 });
+        }
+
+        // Tombol ajaib: muat ulang daftar tugas pribadi ke DM
+        if (cbData === "re_tugas") {
+          await answerCallback(botToken, query.id, "Memuat daftar tugas terbaru...");
+          const accR = await getStudentAccount(supabaseUrl, supabaseKey, userId);
+          if (!accR) {
+            await sendTelegram(botToken, chatId, "🔒 Akun belum terhubung. Login dulu di DM *Bot Master*.", threadId);
+            return new Response('OK', { status: 200 });
+          }
+          await runTugasPersonal(botToken, chatId, threadId, accR, backendUrl, apiKey, supabaseUrl, supabaseKey, datacenterChatId, {
+            userName, userId, cmdMsgId: null,
+            srcMessageId: query.message.chat.type === "private" ? query.message.message_id : null
+          });
           return new Response('OK', { status: 200 });
         }
 
@@ -175,7 +231,7 @@ export default {
           return new Response('OK', { status: 200 });
         }
 
-        await handleKumpulGDrive(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey, text, userName);
+        await handleKumpulGDrive(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey, text, userName, datacenterChatId, msg.message_id);
         return new Response('OK', { status: 200 });
       }
 
@@ -187,8 +243,10 @@ export default {
           return new Response('OK', { status: 200 });
         }
 
-        await sendTelegram(botToken, chatId, `⏳ *Mengambil daftar tugas kuliah aktif untuk ${userName}...*`, threadId);
-        await handleListTugas(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey);
+        // Personal ke DM; command + loading dihapus saat berhasil (lihat handleListTugas)
+        await runTugasPersonal(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey, datacenterChatId, {
+          userName, userId, cmdMsgId: msg.message_id, srcMessageId: null
+        });
         return new Response('OK', { status: 200 });
       }
 
@@ -414,7 +472,7 @@ function parseDeadline(selesaiStr) {
   return isNaN(fallback.getTime()) ? null : fallback;
 }
 
-async function handleListTugas(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey) {
+async function handleListTugas(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey, opts = {}) {
   try {
     const credHeaders = {
       'X-API-Key': apiKey,
@@ -456,7 +514,23 @@ async function handleListTugas(botToken, chatId, threadId, acc, backendUrl, apiK
     } catch (_) {}
 
     if (tasks.length === 0) {
-      await sendTelegram(botToken, chatId, "🎉 *Tidak ada tugas aktif di MyBest saat ini.* Waktunya santai atau riset!", threadId);
+      // Sukses (0 tugas): bersihkan jejak di grup, kabar pribadi ke DM
+      if (opts.cmdMsgId) await deleteMessage(botToken, chatId, opts.cmdMsgId);
+      if (opts.loadingMsgId) await deleteMessage(botToken, chatId, opts.loadingMsgId);
+      const emptyText = "🎉 *Tidak ada tugas aktif di MyBest saat ini.* Waktunya santai atau riset!";
+      if (opts.dmUserId) {
+        const dm = await sendTelegram(botToken, opts.dmUserId, emptyText);
+        if (dm && dm.ok) {
+          await sendTelegram(botToken, chatId, `📋 *${opts.userName || "Kamu"}*, tidak ada tugas aktif — detail dikirim ke DM kamu.`, threadId);
+          await ghostLog(supabaseUrl, supabaseKey, opts.datacenterChatId, botToken, {
+            bot: "gudang", chat_id: chatId, thread_id: threadId,
+            user_id: opts.dmUserId, user_name: opts.userName, nim: acc.nim,
+            command: opts.srcMessageId ? "re_tugas" : "/tugas", detail: "0 tugas aktif → DM", outcome: "success"
+          });
+          return;
+        }
+      }
+      await sendTelegram(botToken, chatId, emptyText, threadId);
       return;
     }
 
@@ -522,15 +596,52 @@ async function handleListTugas(botToken, chatId, threadId, acc, backendUrl, apiK
            `3️⃣ Ketik: \`/kumpul <token> <link_gdrive> [catatan]\`\n\n` +
            `_Contoh:_\n\`/kumpul ${enriched[0].token_tugas || "TOKEN123"} https://drive.google.com/file/d/... tugas pertemuan 1\` 🤍`;
 
-    const replyMarkup = keyboardRows.length > 0 ? { inline_keyboard: keyboardRows } : null;
+    keyboardRows.push([{ text: "🔁 Muat Ulang", callback_data: "re_tugas" }]);
+    const replyMarkup = { inline_keyboard: keyboardRows };
+
+    // Refresh edit-in-place (dari tombol 🔁 Muat Ulang di DM)
+    if (opts.srcMessageId && opts.dmUserId) {
+      const ed = await tgApi(botToken, "editMessageText", {
+        chat_id: opts.dmUserId, message_id: opts.srcMessageId,
+        text: out, parse_mode: "Markdown", reply_markup: replyMarkup
+      });
+      if (ed.ok) return;
+      // gagal edit (pesan terlalu tua / tidak berubah) → lanjut kirim baru
+    }
+
+    // Sukses: hapus jejak di grup (command + loading), hasil personal ke DM
+    if (opts.cmdMsgId) await deleteMessage(botToken, chatId, opts.cmdMsgId);
+    if (opts.loadingMsgId) await deleteMessage(botToken, chatId, opts.loadingMsgId);
+
+    if (opts.dmUserId) {
+      const dm = await sendTelegram(botToken, opts.dmUserId, out, null, replyMarkup);
+      if (dm && dm.ok) {
+        await sendTelegram(botToken, chatId, `📋 *${opts.userName || "Kamu"}*, daftar tugas (${enriched.length}) terkirim ke DM kamu.`, threadId);
+        await ghostLog(supabaseUrl, supabaseKey, opts.datacenterChatId, botToken, {
+          bot: "gudang", chat_id: chatId, thread_id: threadId,
+          user_id: opts.dmUserId, user_name: opts.userName, nim: acc.nim,
+          command: opts.srcMessageId ? "re_tugas" : "/tugas",
+          detail: `${enriched.length} tugas aktif → DM`, outcome: "success"
+        });
+        return;
+      }
+      // DM gagal (anggota belum /start bot ini) → fallback: tampil di grup
+      await ghostLog(supabaseUrl, supabaseKey, opts.datacenterChatId, botToken, {
+        bot: "gudang", chat_id: chatId, thread_id: threadId,
+        user_id: opts.dmUserId, user_name: opts.userName, nim: acc.nim,
+        command: opts.srcMessageId ? "re_tugas" : "/tugas",
+        detail: "DM gagal (belum /start), fallback ke grup", outcome: "dm_fallback"
+      });
+    }
     await sendTelegram(botToken, chatId, out, threadId, replyMarkup);
 
   } catch (err) {
+    // Gagal = biarkan semua pesan tetap ada agar penyebabnya terlihat
     await sendTelegram(botToken, chatId, `⚠️ Gagal memuat daftar tugas: ${err.message}`, threadId);
   }
 }
 
-async function handleKumpulGDrive(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey, text, userName) {
+async function handleKumpulGDrive(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey, text, userName, datacenterChatId, cmdMsgId) {
   const parts = text.split(/\s+/);
   // /kumpul <token> <link> [catatan...]
   if (parts.length < 3) {
@@ -545,6 +656,11 @@ async function handleKumpulGDrive(botToken, chatId, threadId, acc, backendUrl, a
       "_Lihat token aktif dengan mengetik /tugas._",
       threadId
     );
+    await ghostLog(supabaseUrl, supabaseKey, datacenterChatId, botToken, {
+      bot: "gudang", chat_id: chatId, thread_id: threadId,
+      user_id: acc.telegram_user_id, user_name: userName, nim: acc.nim,
+      command: "/kumpul", detail: "format salah (kurang argumen)", outcome: "failed"
+    });
     return;
   }
 
@@ -559,6 +675,11 @@ async function handleKumpulGDrive(botToken, chatId, threadId, acc, backendUrl, a
       "⚠️ *Link tidak valid!*\n\nWajib link Google Drive (`https://drive.google.com/...`).\nJangan lupa set akses *\"Anyone with the link\"* agar dosen bisa membuka.",
       threadId
     );
+    await ghostLog(supabaseUrl, supabaseKey, datacenterChatId, botToken, {
+      bot: "gudang", chat_id: chatId, thread_id: threadId,
+      user_id: acc.telegram_user_id, user_name: userName, nim: acc.nim,
+      command: "/kumpul", detail: `link tidak valid: ${driveLink}`, outcome: "failed"
+    });
     return;
   }
 
@@ -583,6 +704,11 @@ async function handleKumpulGDrive(botToken, chatId, threadId, acc, backendUrl, a
       `⚠️ *Token tugas "${tokenTugas}" tidak ditemukan di daftar aktif MyBest.*${hint}\n\n_Cek kembali dengan mengetik /tugas._`,
       threadId
     );
+    await ghostLog(supabaseUrl, supabaseKey, datacenterChatId, botToken, {
+      bot: "gudang", chat_id: chatId, thread_id: threadId,
+      user_id: acc.telegram_user_id, user_name: userName, nim: acc.nim,
+      command: "/kumpul", detail: `token "${tokenTugas}" tidak ditemukan`, outcome: "failed"
+    });
     return;
   }
 
@@ -619,6 +745,11 @@ async function handleKumpulGDrive(botToken, chatId, threadId, acc, backendUrl, a
       ? "\n\n_(Tabel ubsi_task_submissions belum ada — jalankan sql-add-task-submissions.sql di Supabase.)_"
       : "";
     await sendTelegram(botToken, chatId, `⚠️ Gagal menyimpan pengumpulan: ${errMsg}${hintTable}`, threadId);
+    await ghostLog(supabaseUrl, supabaseKey, datacenterChatId, botToken, {
+      bot: "gudang", chat_id: chatId, thread_id: threadId,
+      user_id: acc.telegram_user_id, user_name: userName, nim: acc.nim,
+      command: "/kumpul", detail: `gagal simpan: ${errMsg} — token ${tokenTugas}`, outcome: "failed"
+    });
     return;
   }
 
@@ -644,12 +775,40 @@ async function handleKumpulGDrive(botToken, chatId, threadId, acc, backendUrl, a
   } : null;
 
   if (!subId) {
-    // Tidak dapat id (mis. duplikat tanpa upsert) -> langsung anggap sukses tersimpan
+    // Tidak dapat id (mis. duplikat tanpa upsert) -> anggap sukses: bersihkan command, pesan tetap
+    if (cmdMsgId) await deleteMessage(botToken, chatId, cmdMsgId);
     await sendTelegram(botToken, chatId, `✅ *Pengumpulan tugas tercatat.* Token: \`${tokenTugas}\``, threadId);
+    await ghostLog(supabaseUrl, supabaseKey, datacenterChatId, botToken, {
+      bot: "gudang", chat_id: chatId, thread_id: threadId,
+      user_id: acc.telegram_user_id, user_name: userName, nim: acc.nim,
+      command: "/kumpul", detail: `tersimpan tanpa id — token ${tokenTugas}`, outcome: "success"
+    });
     return;
   }
 
-  await sendTelegram(botToken, chatId, preview, threadId, replyMarkup);
+  const pvSent = await sendTelegram(botToken, chatId, preview, threadId, replyMarkup);
+
+  // Daftarkan preview + command untuk dibersihkan otomatis saat dikonfirmasi
+  try {
+    await fetch(`${supabaseUrl}/rest/v1/ubsi_ephemeral_msgs`, {
+      method: 'POST',
+      headers: {
+        'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        bot: "gudang", chat_id: chatId, message_id: pvSent?.result?.message_id || 0,
+        thread_id: threadId, user_id: acc.telegram_user_id, user_name: userName,
+        kind: "kumpul_preview", ref_id: subId, cmd_msg_id: cmdMsgId || null
+      })
+    });
+  } catch (_) {}
+
+  await ghostLog(supabaseUrl, supabaseKey, datacenterChatId, botToken, {
+    bot: "gudang", chat_id: chatId, thread_id: threadId,
+    user_id: acc.telegram_user_id, user_name: userName, nim: acc.nim,
+    command: "/kumpul", detail: `menunggu konfirmasi #${subId} — ${task.judul || tokenTugas}`, outcome: "pending"
+  });
 }
 
 async function handleDownloadFile(botToken, chatId, threadId, acc, backendUrl, apiKey, fileUrl, datacenterChatId, title = "Dokumen", course = "") {
@@ -803,5 +962,82 @@ async function answerCallback(token, queryId, text = null) {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
+  });
+}
+
+async function tgApi(token, method, body) {
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    return await resp.json().catch(() => ({ ok: false }));
+  } catch (_) {
+    return { ok: false };
+  }
+}
+
+// Ghost Log: semua yang menguap dari grup tercatat di Supabase + mirror 1 baris ke DATACENTER
+async function ghostLog(supabaseUrl, supabaseKey, datacenterChatId, botToken, entry) {
+  try {
+    await fetch(`${supabaseUrl}/rest/v1/ubsi_ghost_log`, {
+      method: 'POST',
+      headers: {
+        'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(entry)
+    });
+  } catch (_) {}
+  if (datacenterChatId && botToken) {
+    const line =
+      `👻 *GHOST LOG* — ${entry.user_name || "-"}${entry.nim ? ` (${entry.nim})` : ""} • \`${entry.command || "-"}\` • ${entry.outcome || "-"}\n` +
+      `${entry.detail || ""}`;
+    await sendTelegram(botToken, datacenterChatId, line).catch(() => {});
+  }
+}
+
+// Kode resi unik (set aman: tanpa I, L, O, 0, 1)
+function genCode(prefix) {
+  const chars = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+  const buf = new Uint8Array(4);
+  crypto.getRandomValues(buf);
+  let s = "";
+  for (const b of buf) s += chars[b % chars.length];
+  return `${prefix}-${s}`;
+}
+
+// Simpan resi; kegagalan tabel tidak boleh memutus alur utama
+async function saveReceipt(supabaseUrl, supabaseKey, r) {
+  if (!r || !r.code) return null;
+  try {
+    const res = await fetch(`${supabaseUrl}/rest/v1/ubsi_receipts`, {
+      method: 'POST',
+      headers: {
+        'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=ignore-duplicates,return=representation'
+      },
+      body: JSON.stringify(r)
+    });
+    if (res.ok) return r.code;
+  } catch (_) {}
+  return null;
+}
+
+// /tugas versi personal: loading di grup, hasil ke DM, jejak dibersihkan saat berhasil
+async function runTugasPersonal(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey, datacenterChatId, opts = {}) {
+  const userName = opts.userName || "Mahasiswa";
+  let loadingMsgId = null;
+  if (!opts.srcMessageId) {
+    const lm = await sendTelegram(botToken, chatId, `⏳ *Mengambil daftar tugas kuliah aktif untuk ${userName}...*`, threadId);
+    if (lm && lm.ok && lm.result) loadingMsgId = lm.result.message_id;
+  }
+  await handleListTugas(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey, {
+    ...opts,
+    loadingMsgId,
+    dmUserId: opts.dmUserId || opts.userId || null,
+    datacenterChatId
   });
 }

@@ -157,6 +157,18 @@ export default {
         return new Response('OK', { status: 200 });
       }
 
+      // Perintah /ingat — mesin waktu dari arsip ghost log
+      if (text.startsWith('/ingat')) {
+        await handleIngat(botToken, chatId, supabaseUrl, supabaseKey, text);
+        return new Response('OK', { status: 200 });
+      }
+
+      // Perintah /cek — verifikasi resi anti-rekayasa
+      if (text.startsWith('/cek')) {
+        await handleCekResi(botToken, chatId, supabaseUrl, supabaseKey, text);
+        return new Response('OK', { status: 200 });
+      }
+
       // Perintah /setnama <Nama Lengkap>
       if (text.startsWith('/setnama')) {
         const newName = text.replace(/^\/setnama/, '').trim();
@@ -439,21 +451,30 @@ export default {
           const assignData = await assignRes.json();
           if (!assignData.success || !assignData.data || !assignData.data.tasks) continue;
 
-          const pendingTasks = assignData.data.tasks.filter(t => {
-            const st = (t.status || '').toLowerCase();
-            return !st.includes('sudah') && !st.includes('selesai');
-          });
+          // Tugas yang sudah dikumpulkan via GDrive tidak perlu diingatkan lagi
+          let doneTokens = new Set();
+          try {
+            const subRes = await fetch(`${supabaseUrl}/rest/v1/ubsi_task_submissions?nim=eq.${encodeURIComponent(acc.nim)}&status=eq.submitted&select=token_tugas`, {
+              headers: { 'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}` }
+            });
+            const subs = await subRes.json();
+            if (Array.isArray(subs)) doneTokens = new Set(subs.map(s => s.token_tugas));
+          } catch (_) {}
+
+          const pendingTasks = assignData.data.tasks.filter(t =>
+            t.token_tugas && !doneTokens.has(t.token_tugas)
+          );
 
           if (pendingTasks.length > 0) {
-            let notifText = 
+            let notifText =
               `⏰ *PENGINGAT TUGAS MYBEST (${acc.full_name || 'Mahasiswa'})*\n` +
               `━━━━━━━━━━━━━━━━━━━━\n` +
-              `Ada *${pendingTasks.length} tugas aktif* yang belum selesai:\n\n`;
+              `Ada *${pendingTasks.length} tugas aktif* yang belum dikumpulkan:\n\n`;
 
             pendingTasks.slice(0, 3).forEach((t, i) => {
-              notifText += `${i + 1}. *${t.mata_kuliah || t.kode || 'Mata Kuliah'}*\n` +
-                          `   📌 Tugas: ${t.tugas || t.nama || 'Tugas Kuliah'}\n` +
-                          `   ⏳ Batas: ${t.batas_waktu || '-'}\n\n`;
+              notifText += `${i + 1}. *${t.kode || 'Mata Kuliah'}*\n` +
+                          `   📌 Tugas: ${t.judul || 'Tugas Kuliah'}\n` +
+                          `   ⏳ Batas: ${t.selesai || '-'}\n\n`;
             });
 
             notifText += `_Buka Topik Gudang & E-Learning atau ketik /tugas untuk unduh & kumpul tugas!_ 🤍`;
@@ -676,4 +697,86 @@ async function deleteTelegramMessage(token, chatId, messageId) {
       body: JSON.stringify({ chat_id: chatId, message_id: messageId })
     });
   } catch (_) {}
+}
+
+// ── MESIN WAKTU: cari jejak di arsip ghost log (grup melupakan, bot mengingat) ──
+async function handleIngat(botToken, chatId, supabaseUrl, supabaseKey, text) {
+  const kwRaw = text.replace(/^\/ingat(@\w+)?/, '').trim();
+  try {
+    let url;
+    const kw = encodeURIComponent(kwRaw);
+    if (kwRaw && /^\d+$/.test(kwRaw)) {
+      url = `${supabaseUrl}/rest/v1/ubsi_ghost_log?or=(command.ilike.*${kw}*,detail.ilike.*${kw}*,user_name.ilike.*${kw}*,nim.eq.${kwRaw})&order=created_at.desc&limit=10`;
+    } else if (kwRaw) {
+      url = `${supabaseUrl}/rest/v1/ubsi_ghost_log?or=(command.ilike.*${kw}*,detail.ilike.*${kw}*,user_name.ilike.*${kw}*)&order=created_at.desc&limit=10`;
+    } else {
+      url = `${supabaseUrl}/rest/v1/ubsi_ghost_log?order=created_at.desc&limit=10`;
+    }
+
+    const res = await fetch(url, {
+      headers: { 'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}` }
+    });
+    const rows = await res.json().catch(() => []);
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      await sendTelegram(botToken, chatId, kwRaw
+        ? `🧠 Mesin Waktu: tidak ada jejak *"${kwRaw}"* di arsip. Arsipnya bersih.`
+        : `🧠 Arsip masih kosong — belum ada aktivitas yang menguap dari grup.`);
+      return;
+    }
+
+    let out = kwRaw
+      ? `🧠 *MESIN WAKTU — jejak "${kwRaw}" (${rows.length}):*\n\n`
+      : `🧠 *MESIN WAKTU — 10 aktivitas terakhir:*\n\n`;
+    rows.forEach(r => {
+      const t = r.created_at ? new Date(r.created_at).toLocaleString('id-ID', { timeZone: 'Asia/Pontianak' }) : '-';
+      out += `• ${t} WIB — *${r.user_name || '-'}*${r.nim ? ` (${r.nim})` : ""}\n`;
+      out += `  \`${r.command || "-"}\` → ${r.outcome || "-"}\n`;
+      if (r.detail) out += `  ${r.detail}\n`;
+    });
+    out += `\n_Grup melupakan, bot mengingat._ 🤍`;
+    await sendTelegram(botToken, chatId, out);
+  } catch (err) {
+    await sendTelegram(botToken, chatId, `⚠️ Gagal membuka arsip: ${err.message}`);
+  }
+}
+
+// ── VERIFIKASI RESI: bukti kumpul/absen anti-rekayasa ──
+async function handleCekResi(botToken, chatId, supabaseUrl, supabaseKey, text) {
+  const kode = text.replace(/^\/cek(@\w+)?/, '').trim().toUpperCase();
+  if (!kode) {
+    await sendTelegram(botToken, chatId, "🧾 Kirim kode resi yang mau diverifikasi:\n`/cek KMP-7F3A`");
+    return;
+  }
+  if (!/^(KMP|ABS)-[A-Z0-9]{4}$/.test(kode)) {
+    await sendTelegram(botToken, chatId,
+      `⚠️ Format resi tidak dikenal: \`${kode}\`\nContoh yang benar: \`KMP-7F3A\` (kumpul tugas) atau \`ABS-9QX2\` (absen).`);
+    return;
+  }
+  try {
+    const res = await fetch(`${supabaseUrl}/rest/v1/ubsi_receipts?code=ilike.${kode}&select=*`, {
+      headers: { 'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}` }
+    });
+    const rows = await res.json().catch(() => []);
+    const r = Array.isArray(rows) ? rows[0] : null;
+
+    if (!r) {
+      await sendTelegram(botToken, chatId,
+        `❌ *Resi \`${kode}\` TIDAK ditemukan* di sistem USRC.\nHati-hati: bukti yang dipegang bisa jadi bukan asli.`);
+      return;
+    }
+
+    const t = r.created_at ? new Date(r.created_at).toLocaleString('id-ID', { timeZone: 'Asia/Pontianak' }) : '-';
+    await sendTelegram(botToken, chatId,
+      `✅ *RESI TERVERIFIKASI ASLI*\n` +
+      `━━━━━━━━━━━━━━━━━━━━\n` +
+      `🧾 Kode: \`${r.code}\`\n` +
+      `📌 Jenis: *${r.type === 'kumpul' ? 'Pengumpulan Tugas' : 'Presensi'}*\n` +
+      `👤 ${r.full_name || '-'} (${r.nim || '-'})\n` +
+      `📝 ${r.summary || '-'}\n` +
+      `📅 ${t} WIB\n\n` +
+      `_Bukti ini sah dan tercatat permanen._ 🤍`);
+  } catch (err) {
+    await sendTelegram(botToken, chatId, `⚠️ Gagal memverifikasi resi: ${err.message}`);
+  }
 }

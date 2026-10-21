@@ -38,6 +38,8 @@ Menggunakan **Arsitektur 4 Bot (3 Bot Pekerja Spesialis di Topik Grup + 1 Bot Ma
   - `/start`: Panduan onboarding mahasiswa.
   - `/login <NIM> <PASSWORD>`: Verifikasi akun ke sistem kampus dan simpan aman ke Supabase.
   - Pusat pengiriman bukti presensi dan laporan analisis nilai rahasia.
+  - `/ingat <kata kunci>`: Mesin Waktu — cari jejak di arsip ghost log (semua yang menguap dari grup tercatat di `ubsi_ghost_log`). Tanpa kata kunci = 10 aktivitas terakhir.
+  - `/cek <KODE>`: Verifikasi resi anti-rekayasa (contoh `/cek KMP-7F3A`). Resi tidak ditemukan = bukti yang dipegang bukan asli.
 
 ### 📚 2. Bot Gudang Materi (`worker-gudang.js`)
 - **Lokasi:** Topik *Gudang Materi & Jurnal*
@@ -47,16 +49,18 @@ Menggunakan **Arsitektur 4 Bot (3 Bot Pekerja Spesialis di Topik Grup + 1 Bot Ma
   - `/jurnal`: Menampilkan direktori e-journal resmi kampus.
   - `/materi <kata kunci>`: Unduh slide/PDF materi MyBest (dikirim sebagai file + mirror DATACENTER).
   - `/tugas`: Daftar tugas aktif (nama matkul, deadline, status pengumpulan) + tombol unduh soal.
+    Hasil personal dikirim ke DM anggota; di grup hanya notifikasi ringkas (command dihapus).
   - `/kumpul <token_tugas> <link_gdrive> [catatan]`: Pengumpulan tugas via Google Drive
     (wajib link dengan akses *"Anyone with the link"*; tersimpan di tabel `ubsi_task_submissions`).
+    Saat berhasil, command + pesan proses dihapus otomatis — yang nempel hanya bukti berhasil + resi `KMP-XXXX`.
 
 ### ⚡ 3. Bot Absensi MyBest (`worker-absen.js`)
 - **Lokasi:** Topik *E-Learning & Absen*
 - **Fungsi:**
   - `/absen` atau `/menu`: Memunculkan menu interaktif.
   - Tombol `[ ⚡ Absen Kelas Sekarang ]`: Deteksi sesi aktif di MyBest, bypass captcha teks, dan submit presensi mahasiswa.
-  - Tombol `[ 📋 Cek Jadwal Kuliah ]`: Menampilkan jadwal kuliah mahasiswa bersangkutan.
-  - Mengirimkan bukti kehadiran resmi ke DM via Bot Master.
+  - Tombol `[ 📋 Cek Jadwal Kuliah ]`: **List hidup** jadwal kuliah — hitung mundur live per matkul, update sendiri tiap menit, menguap otomatis dalam 20 menit.
+  - Mengirimkan bukti kehadiran resmi ke DM via Bot Master, lengkap dengan resi `ABS-XXXX`.
 
 ### 📈 4. Bot Statistik & Nilai (`worker-stats.js`)
 - **Lokasi:** Topik *Statistik Mahasiswa*
@@ -101,6 +105,23 @@ curl -X POST "https://api.telegram.org/bot<BOT_TOKEN>/setWebhook" \
   -H "Content-Type: application/json" \
   -d '{"url": "https://<NAMA-WORKER>.workers.dev", "ip_address": "172.67.171.211"}'
 ```
+
+---
+
+## 4b. Clean Group Experience (v2.1)
+
+Prinsip: grup tampil seperti papan informasi yang selalu bersih — yang nempel hanya bukti berhasil dan menu; sisanya menguap tapi tercatat.
+
+- **Transaksi** (`/kumpul`, absen): proses tampil normal → saat **berhasil**, command + pesan proses dihapus otomatis; yang tersisa hanya bukti berhasil + resi. **Gagal = tidak ada yang dihapus** (penyebab tetap terlihat).
+- **Jadwal (list hidup):** tombol `[ 📋 Cek Jadwal Kuliah ]` menghasilkan list dengan hitung mundur live; diedit tiap menit oleh cron worker absen, menguap otomatis dalam 20 menit. Tombol `[ 🔄 Perbarui ]` memuat ulang tanpa pesan baru.
+- **Tugas personal:** `/tugas` mengirim hasil ke DM anggota; grup hanya menerima notifikasi ringkas. Fallback: bila anggota belum `/start` bot gudang, list tampil di grup seperti biasa.
+- **Ghost Log:** setiap command/list yang menguap dicatat ke tabel `ubsi_ghost_log` (+ mirror satu baris ke channel DATACENTER dari worker gudang). Telusuri lewat `/ingat <kata kunci>` di Bot Master.
+- **Resi anti-rekayasa:** bukti kumpul (`KMP-XXXX`) dan absen (`ABS-XXXX`) tersimpan di `ubsi_receipts`; verifikasi via `/cek <KODE>` di Bot Master.
+
+**Wajib saat deploy:**
+1. Jalankan `sql-ghost-resi-ephemeral.sql` di Supabase SQL Editor (3 tabel baru: ghost log, receipts, ephemeral msgs).
+2. Worker **absen** harus diberi Cron Trigger `* * * * *` di dashboard Cloudflare (Settings → Triggers) agar list jadwal berdetak dan sweep berjalan.
+3. Env `DATACENTER_CHAT_ID` di worker gudang mengaktifkan mirror ghost log ke channel arsip (opsional).
 
 ---
 
