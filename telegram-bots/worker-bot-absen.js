@@ -1,9 +1,13 @@
 /**
- * USRC BOT ABSENSI (E-Learning & Presensi MyBest)
- * Menangani di Topik Grup:
- * 1. Tombol menu interaktif: [ ⚡ Absen Sekarang ] & [ 📋 Jadwal Hari Ini ]
- * 2. Eksekusi presensi otomatis via backend UBSI-API
- * 3. Kirim status publik ke topik + bukti lengkap ke DM via Bot Master
+ * USRC BOT ABSENSI (E-Learning & Presensi MyBest) — V2 "Topik Terkunci"
+ *
+ * Konsep grup bersih:
+ * - Topik absen ditutup; hanya ada 1 pesan PIN berisi 3 tombol:
+ *   [ ⚡ Absen Sekarang ] [ 📋 Cek Jadwal ] [ 🔍 Cek Status Absen ]
+ * - Output SUKSES (resi absen + jadwal) → DM via Bot Master.
+ * - Output GAGAL / STATUS → flash di topik, auto-delete 10 detik.
+ * - /pasang (admin) → kirim menu, pin, lalu tutup topik.
+ * - /buka   (admin) → buka kembali topik untuk maintenance.
  */
 
 export default {
@@ -37,6 +41,8 @@ export default {
           return new Response('OK', { status: 200 });
         }
 
+        // ── SETUP MENU PIN (klik tombol dari pesan setup tidak diproses khusus) ──
+
         // Ambil akun mahasiswa dari Supabase
         const acc = await getStudentAccount(supabaseUrl, supabaseKey, userId);
 
@@ -45,6 +51,7 @@ export default {
           return new Response('OK', { status: 200 });
         }
 
+        // ══ TOMBOL 1: ABSEN SEKARANG ══
         if (cbData === "btn_absen_now") {
           await answerCallback(botToken, query.id, "Sedang memproses presensi ke MyBest...");
 
@@ -63,7 +70,12 @@ export default {
 
             if (!presRes.ok && (!presRes.data || !presRes.data.success)) {
               const errMsg = presRes.data?.error?.message || (presRes.status === 502 ? "Server backend/kampus sedang sibuk (502). Coba sesaat lagi." : `Gagal menghubungi server (${presRes.status})`);
-              await sendTelegram(botToken, chatId, `⚠️ *Gagal Absen (${userName}):*\n${errMsg}`, threadId);
+              await sendFlash(ctx, botToken, chatId, threadId, `⚠️ *Gagal Absen (${userName}):*\n${errMsg}`);
+              await ghostLog(supabaseUrl, supabaseKey, botToken, {
+                bot: "absen", chat_id: chatId, thread_id: threadId,
+                user_id: userId, user_name: userName, nim: acc.nim,
+                command: "btn_absen_now", detail: String(errMsg), outcome: "failed"
+              });
               return new Response('OK', { status: 200 });
             }
 
@@ -88,18 +100,10 @@ export default {
                 ref_id: null,
               });
 
-              // 1. Notif Ringkas di Topik Grup (bukti yang nempel)
-              await sendTelegram(
-                botToken,
-                chatId,
-                `✅ *Presensi Berhasil!*\n\n• Mahasiswa: *${userName}*\n• Matkul: *${mkName}*\n• Status: *Hadir di MyBest* ⚡` +
-                (resiCode ? `\n🧾 Resi: \`${resiCode}\`` : ""),
-                threadId
-              );
-
-              // 2. Bukti Detail dikirim ke DM Mahasiswa via Bot Master
+              // Grup tetap BERSIH: sukses hanya dikirim ke DM via Bot Master
+              let dmOk = false;
               if (masterBotToken) {
-                await sendTelegram(
+                const dm = await sendTelegram(
                   masterBotToken,
                   userId,
                   `🎓 *BUKTI PRESENSI ELEARNING BERHASIL*\n\n` +
@@ -111,23 +115,29 @@ export default {
                   (resiCode ? `• Resi: \`${resiCode}\` _(verifikasi: /cek ${resiCode})_\n` : "") +
                   `\nStatus kehadiranmu sudah tercatat resmi di portal MyBest kampus! 🤍`
                 );
+                dmOk = !!(dm && dm.ok);
+              }
+
+              if (!dmOk) {
+                // DM gagal (belum Start Bot Master / diblokir) → flash 10 dtk di topik
+                await sendFlash(
+                  ctx, botToken, chatId, threadId,
+                  `✅ *Presensi ${userName} BERHASIL* — matkul *${mkName}*` +
+                  (resiCode ? `\n🧾 Resi: \`${resiCode}\`` : "") +
+                  `\n⚠️ Bukti lengkap gagal dikirim ke DM. Buka DM Bot Master lalu tekan Start.`
+                );
               }
 
               await ghostLog(supabaseUrl, supabaseKey, botToken, {
                 bot: "absen", chat_id: chatId, thread_id: threadId,
                 user_id: userId, user_name: acc.full_name || userName, nim: acc.nim,
                 command: "btn_absen_now",
-                detail: `presensi "${mkName}" (${dosen}) — resi ${resiCode || "-"}`,
+                detail: `presensi "${mkName}" (${dosen}) — resi ${resiCode || "-"} → DM master ${dmOk ? "terkirim" : "GAGAL"}`,
                 outcome: "success"
               });
             } else {
               const msgErr = r.message || r.status || presData.error?.message || "Tidak ada sesi kuliah yang sedang membuka presensi saat ini.";
-              await sendTelegram(
-                botToken,
-                chatId,
-                `⚠️ *Gagal Absen (${userName}):*\n${msgErr}`,
-                threadId
-              );
+              await sendFlash(ctx, botToken, chatId, threadId, `⚠️ *Gagal Absen (${userName}):*\n${msgErr}`);
               await ghostLog(supabaseUrl, supabaseKey, botToken, {
                 bot: "absen", chat_id: chatId, thread_id: threadId,
                 user_id: userId, user_name: userName, nim: acc.nim,
@@ -135,7 +145,7 @@ export default {
               });
             }
           } catch (err) {
-            await sendTelegram(botToken, chatId, `❌ Terjadi kesalahan sistem: ${err.message}`, threadId);
+            await sendFlash(ctx, botToken, chatId, threadId, `❌ Terjadi kesalahan sistem: ${err.message}`);
             await ghostLog(supabaseUrl, supabaseKey, botToken, {
               bot: "absen", chat_id: chatId, thread_id: threadId,
               user_id: userId, user_name: userName, nim: acc ? acc.nim : null,
@@ -146,9 +156,9 @@ export default {
           return new Response('OK', { status: 200 });
         }
 
+        // ══ TOMBOL 2: CEK JADWAL (output → DM Bot Master) ══
         if (cbData === "btn_jadwal_today" || cbData === "re_jadwal") {
-          const isRefresh = cbData === "re_jadwal";
-          await answerCallback(botToken, query.id, isRefresh ? "Memperbarui jadwal..." : "Mengambil jadwal kuliah...");
+          await answerCallback(botToken, query.id, "Mengambil jadwal kuliah...");
 
           try {
             const siakadPass = acc.siakad_password || acc.encrypted_password;
@@ -164,7 +174,7 @@ export default {
 
             if (!schRes.ok && (!schRes.data || !schRes.data.success)) {
               const errMsg = schRes.data?.error?.message || (schRes.status === 502 ? "Portal SIAKAD kampus sedang lambat/down (502). Coba sesaat lagi." : `Gagal mengambil jadwal (${schRes.status})`);
-              await sendTelegram(botToken, chatId, `⚠️ *Gagal Jadwal (${userName}):*\n${errMsg}`, threadId);
+              await sendFlash(ctx, botToken, chatId, threadId, `⚠️ *Gagal Jadwal (${userName}):*\n${errMsg}`);
               await ghostLog(supabaseUrl, supabaseKey, botToken, {
                 bot: "absen", chat_id: chatId, thread_id: threadId,
                 user_id: userId, user_name: userName, nim: acc.nim,
@@ -176,7 +186,12 @@ export default {
             const schData = schRes.data || {};
 
             if (!schData.success || !schData.data || schData.data.length === 0) {
-              await sendTelegram(botToken, chatId, `📋 Tidak ada jadwal kuliah terdaftar untuk NIM *${acc.nim}*.`, threadId);
+              await sendFlash(ctx, botToken, chatId, threadId, `📋 Tidak ada jadwal kuliah terdaftar untuk NIM *${acc.nim}*.`);
+              await ghostLog(supabaseUrl, supabaseKey, botToken, {
+                bot: "absen", chat_id: chatId, thread_id: threadId,
+                user_id: userId, user_name: userName, nim: acc.nim,
+                command: cbData, detail: "jadwal kosong", outcome: "failed"
+              });
               return new Response('OK', { status: 200 });
             }
 
@@ -188,55 +203,103 @@ export default {
               ruang: j.ruang || "-"
             }));
 
-            const textSch = renderJadwalText(items, EPHEMERAL_MINUTES);
-            const jadwalKb = { inline_keyboard: [[{ text: "🔄 Perbarui", callback_data: "re_jadwal" }]] };
-
-            if (isRefresh) {
-              // Edit-in-place + reset kedaluwarsa list hidup
-              const ed = await tgApi(botToken, "editMessageText", {
-                chat_id: chatId, message_id: query.message.message_id,
-                text: textSch, parse_mode: "Markdown", reply_markup: jadwalKb
-              });
-              if (ed.ok) {
-                await patchEphemeralJadwal(supabaseUrl, supabaseKey, chatId, query.message.message_id, items);
-              } else {
-                const sent = await sendTelegram(botToken, chatId, textSch, threadId, jadwalKb);
-                await registerEphemeral(supabaseUrl, supabaseKey, {
-                  bot: "absen", chat_id: chatId, message_id: sent?.result?.message_id || 0,
-                  thread_id: threadId, user_id: userId, user_name: userName,
-                  kind: "jadwal", payload: { items },
-                  expires_at: new Date(Date.now() + EPHEMERAL_MINUTES * 60000).toISOString()
-                });
-              }
-              await ghostLog(supabaseUrl, supabaseKey, botToken, {
-                bot: "absen", chat_id: chatId, thread_id: threadId,
-                user_id: userId, user_name: userName, nim: acc.nim,
-                command: "re_jadwal", detail: `${items.length} jadwal diperbarui (list hidup)`, outcome: "success"
-              });
-              return new Response('OK', { status: 200 });
+            // Kirim ke DM mahasiswa via Bot Master (grup tetap bersih)
+            let dmOk = false;
+            if (masterBotToken) {
+              const dm = await sendTelegram(masterBotToken, userId, renderJadwalText(items));
+              dmOk = !!(dm && dm.ok);
             }
 
-            const sent = await sendTelegram(botToken, chatId, textSch, threadId, jadwalKb);
-
-            // Daftarkan sebagai list hidup: tick tiap menit, menguap otomatis
-            await registerEphemeral(supabaseUrl, supabaseKey, {
-              bot: "absen", chat_id: chatId, message_id: sent?.result?.message_id || 0,
-              thread_id: threadId, user_id: userId, user_name: userName,
-              kind: "jadwal", payload: { items },
-              expires_at: new Date(Date.now() + EPHEMERAL_MINUTES * 60000).toISOString()
-            });
+            if (!dmOk) {
+              await sendFlash(
+                ctx, botToken, chatId, threadId,
+                `⚠️ *${userName}*, jadwal gagal dikirim ke DM.\nBuka DM Bot Master dulu lalu tekan Start, setelah itu coba lagi.`
+              );
+            }
 
             await ghostLog(supabaseUrl, supabaseKey, botToken, {
               bot: "absen", chat_id: chatId, thread_id: threadId,
               user_id: userId, user_name: userName, nim: acc.nim,
-              command: "btn_jadwal_today", detail: `${items.length} jadwal → list hidup ${EPHEMERAL_MINUTES} menit`, outcome: "success"
+              command: "btn_jadwal_today",
+              detail: `${items.length} jadwal → DM master ${dmOk ? "terkirim" : "GAGAL"}`,
+              outcome: dmOk ? "success" : "failed"
             });
           } catch (err) {
-            await sendTelegram(botToken, chatId, `❌ Gagal mengambil jadwal: ${err.message}`, threadId);
+            await sendFlash(ctx, botToken, chatId, threadId, `❌ Gagal mengambil jadwal: ${err.message}`);
             await ghostLog(supabaseUrl, supabaseKey, botToken, {
               bot: "absen", chat_id: chatId, thread_id: threadId,
               user_id: userId, user_name: userName, nim: acc ? acc.nim : null,
               command: cbData, detail: `error sistem: ${err.message}`, outcome: "failed"
+            });
+          }
+
+          return new Response('OK', { status: 200 });
+        }
+
+        // ══ TOMBOL 3: CEK STATUS ABSEN (flash 10 dtk di topik) ══
+        if (cbData === "btn_status_absen") {
+          await answerCallback(botToken, query.id, "Memeriksa status sesi absen...");
+
+          try {
+            const stRes = await safeFetchJson(`${backendUrl}/v1/elearning/presence`, {
+              headers: {
+                'X-API-Key': apiKey,
+                'X-Elearning-NIM': acc.nim,
+                'X-Elearning-Pass': acc.encrypted_password,
+                'X-Nim': acc.nim,
+                'X-Pass': acc.encrypted_password,
+              }
+            });
+
+            if (!stRes.ok && (!stRes.data || !stRes.data.success)) {
+              const errMsg = stRes.data?.error?.message || (stRes.status === 502 ? "Server backend/kampus sedang sibuk (502). Coba sesaat lagi." : `Gagal memeriksa status (${stRes.status})`);
+              await sendFlash(ctx, botToken, chatId, threadId, `⚠️ *Cek Status (${userName}):*\n${errMsg}`);
+              await ghostLog(supabaseUrl, supabaseKey, botToken, {
+                bot: "absen", chat_id: chatId, thread_id: threadId,
+                user_id: userId, user_name: userName, nim: acc.nim,
+                command: "btn_status_absen", detail: String(errMsg), outcome: "failed"
+              });
+              return new Response('OK', { status: 200 });
+            }
+
+            const s = (stRes.data && stRes.data.data) || {};
+
+            if (s.can_submit) {
+              await sendFlash(
+                ctx, botToken, chatId, threadId,
+                `🟢 *SESI ABSEN TERBUKA!*\n` +
+                `• Matkul: *${s.matakuliah || "-"}*\n` +
+                `• Dosen: *${s.dosen || "-"}*\n` +
+                `• Jam: *${s.jam_masuk || "-"}${s.jam_keluar ? " - " + s.jam_keluar : ""}*\n` +
+                `Gas tekan ⚡ *Absen Sekarang* sebelum tutup!`
+              );
+              await ghostLog(supabaseUrl, supabaseKey, botToken, {
+                bot: "absen", chat_id: chatId, thread_id: threadId,
+                user_id: userId, user_name: acc.full_name || userName, nim: acc.nim,
+                command: "btn_status_absen",
+                detail: `sesi TERBUKA: ${s.matakuliah || "-"} (${s.status_sesi || "-"})`,
+                outcome: "success"
+              });
+            } else {
+              const statusTxt = s.status_sesi ? `Status sesi: *${s.status_sesi}*` : "Tidak ada sesi presensi yang aktif saat ini.";
+              await sendFlash(
+                ctx, botToken, chatId, threadId,
+                `🔴 *SESI ABSEN TUTUP*\n${statusTxt}\nTombol ⚡ Absen tetap bisa dicoba saat sesi dibuka dosen.`
+              );
+              await ghostLog(supabaseUrl, supabaseKey, botToken, {
+                bot: "absen", chat_id: chatId, thread_id: threadId,
+                user_id: userId, user_name: userName, nim: acc.nim,
+                command: "btn_status_absen",
+                detail: `sesi tutup: ${s.status_sesi || "tidak ada sesi"}`,
+                outcome: "success"
+              });
+            }
+          } catch (err) {
+            await sendFlash(ctx, botToken, chatId, threadId, `❌ Gagal memeriksa status: ${err.message}`);
+            await ghostLog(supabaseUrl, supabaseKey, botToken, {
+              bot: "absen", chat_id: chatId, thread_id: threadId,
+              user_id: userId, user_name: userName, nim: acc ? acc.nim : null,
+              command: "btn_status_absen", detail: `error sistem: ${err.message}`, outcome: "failed"
             });
           }
 
@@ -250,6 +313,7 @@ export default {
         const chatId = msg.chat.id;
         const threadId = msg.message_thread_id || null;
         const text = (msg.text || '').trim();
+        const fromId = msg.from ? msg.from.id : null;
 
         // ── KUNCI SATPAM TOPIK ABSEN (Thread ID: 4) ──
         const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
@@ -257,23 +321,46 @@ export default {
           return new Response('Ignored out-of-topic message', { status: 200 });
         }
 
+        // /pasang — ADMIN ONLY: kirim menu, pin, lalu TUTUP topik
+        if (isGroup && text.startsWith('/pasang')) {
+          if (!(await isAdmin(botToken, chatId, fromId))) {
+            await sendFlash(ctx, botToken, chatId, threadId, `⛔ Perintah ini khusus admin.`);
+            return new Response('OK', { status: 200 });
+          }
+
+          const sent = await sendTelegram(botToken, chatId, MENU_TEXT, threadId, MENU_KEYBOARD);
+          if (sent && sent.ok && sent.result && sent.result.message_id) {
+            await tgApi(botToken, "pinChatMessage", {
+              chat_id: chatId, message_id: sent.result.message_id, disable_notification: true
+            });
+          }
+          await tgApi(botToken, "closeForumTopic", { chat_id: chatId, message_thread_id: 4 });
+          await ghostLog(supabaseUrl, supabaseKey, botToken, {
+            bot: "absen", chat_id: chatId, thread_id: threadId,
+            user_id: fromId, user_name: (msg.from && msg.from.first_name) || "admin", nim: null,
+            command: "/pasang", detail: "menu dipin + topik ditutup", outcome: "success"
+          });
+          return new Response('OK', { status: 200 });
+        }
+
+        // /buka — ADMIN ONLY: buka kembali topik (maintenance)
+        if (isGroup && text.startsWith('/buka')) {
+          if (!(await isAdmin(botToken, chatId, fromId))) {
+            await sendFlash(ctx, botToken, chatId, threadId, `⛔ Perintah ini khusus admin.`);
+            return new Response('OK', { status: 200 });
+          }
+          await tgApi(botToken, "reopenForumTopic", { chat_id: chatId, message_thread_id: 4 });
+          await ghostLog(supabaseUrl, supabaseKey, botToken, {
+            bot: "absen", chat_id: chatId, thread_id: threadId,
+            user_id: fromId, user_name: (msg.from && msg.from.first_name) || "admin", nim: null,
+            command: "/buka", detail: "topik dibuka untuk maintenance", outcome: "success"
+          });
+          return new Response('OK', { status: 200 });
+        }
+
+        // /menu atau /absen — kirim ulang menu tombol (untuk re-pin manual)
         if (text.startsWith('/absen') || text.startsWith('/menu')) {
-          const menuText = 
-            "⚡ *PORTAL PRESENSI ELEARNING USRC*\n\n" +
-            "Pastikan akunmu sudah login di DM Bot Master. Klik tombol di bawah untuk eksekusi cepat:";
-
-          const keyboard = {
-            inline_keyboard: [
-              [
-                { text: "⚡ Absen Kelas Sekarang", callback_data: "btn_absen_now" }
-              ],
-              [
-                { text: "📋 Cek Jadwal Kuliah", callback_data: "btn_jadwal_today" }
-              ]
-            ]
-          };
-
-          await sendTelegram(botToken, chatId, menuText, threadId, keyboard);
+          await sendTelegram(botToken, chatId, MENU_TEXT, threadId, MENU_KEYBOARD);
           return new Response('OK', { status: 200 });
         }
       }
@@ -285,7 +372,7 @@ export default {
     }
   },
 
-  // ── CRON TIAP MENIT: tick list jadwal hidup + sweep yang kedaluwarsa ──
+  // ── CRON: sweep pesan ephemeral legacy yang tersisa (menu sekarang 10 dtk via waitUntil) ──
   async scheduled(event, env, ctx) {
     const botToken = env.BOT_TOKEN_ABSEN;
     const supabaseUrl = env.SUPABASE_URL || 'https://wagvbmkimpswiidnenwx.supabase.co';
@@ -301,45 +388,54 @@ export default {
 
       const now = Date.now();
       for (const row of rows) {
-        const expired = row.expires_at && new Date(row.expires_at).getTime() <= now;
-
-        if (expired) {
+        if (row.expires_at && new Date(row.expires_at).getTime() <= now) {
           if (row.message_id) await deleteMessage(botToken, row.chat_id, row.message_id);
           await fetch(`${supabaseUrl}/rest/v1/ubsi_ephemeral_msgs?id=eq.${row.id}`, {
             method: 'DELETE',
             headers: { 'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}` }
           }).catch(() => {});
-          await ghostLog(supabaseUrl, supabaseKey, botToken, {
-            bot: "absen", chat_id: row.chat_id, thread_id: row.thread_id,
-            user_id: row.user_id, user_name: row.user_name, nim: null,
-            command: `${row.kind}_kedaluwarsa`, detail: "list hidup menguap dari grup", outcome: "expired"
-          });
-          continue;
-        }
-
-        // Masih hidup & jadwal: tick hitung mundur tiap menit (edit-in-place)
-        if (row.kind === 'jadwal' && row.payload && Array.isArray(row.payload.items)) {
-          const sisaMenit = Math.max(0, Math.round((new Date(row.expires_at).getTime() - now) / 60000));
-          const ed = await tgApi(botToken, "editMessageText", {
-            chat_id: row.chat_id, message_id: row.message_id,
-            text: renderJadwalText(row.payload.items, sisaMenit),
-            parse_mode: "Markdown",
-            reply_markup: { inline_keyboard: [[{ text: "🔄 Perbarui", callback_data: "re_jadwal" }]] }
-          });
-          if (!ed.ok) {
-            // "message is not modified" = teks sama, biarkan; selain itu pesan sudah hilang → drop row
-            if (!/not modified/i.test(ed.description || "")) {
-              await fetch(`${supabaseUrl}/rest/v1/ubsi_ephemeral_msgs?id=eq.${row.id}`, {
-                method: 'DELETE',
-                headers: { 'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}` }
-              }).catch(() => {});
-            }
-          }
         }
       }
     } catch (_) {}
   }
 };
+
+// ── MENU PIN (3 tombol) ──
+const MENU_TEXT =
+  "⚡ *PORTAL PRESENSI ELEARNING USRC*\n\n" +
+  "Topik ini terkunci — cukup tekan tombol di bawah:\n" +
+  "• Hasil absen & jadwal dikirim ke *DM Bot Master*\n" +
+  "• Notif gagal/status muncul 10 detik lalu terhapus sendiri";
+
+const MENU_KEYBOARD = {
+  inline_keyboard: [
+    [{ text: "⚡ Absen Sekarang", callback_data: "btn_absen_now" }],
+    [{ text: "📋 Cek Jadwal", callback_data: "btn_jadwal_today" }],
+    [{ text: "🔍 Cek Status Absen", callback_data: "btn_status_absen" }]
+  ]
+};
+
+// ── FLASH 10 DETIK: kirim ke topik lalu auto-delete (ctx.waitUntil agar tak mati sebelum hapus) ──
+const FLASH_SECONDS = 10;
+
+function sendFlash(ctx, token, chatId, threadId, text) {
+  return sendTelegram(token, chatId, text, threadId).then(sent => {
+    const msgId = sent && sent.result && sent.result.message_id;
+    if (msgId) {
+      const job = new Promise(r => setTimeout(r, FLASH_SECONDS * 1000))
+        .then(() => deleteMessage(token, chatId, msgId));
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job);
+    }
+    return sent;
+  });
+}
+
+async function isAdmin(token, chatId, userId) {
+  if (!userId) return false;
+  const res = await tgApi(token, "getChatMember", { chat_id: chatId, user_id: userId });
+  const st = res && res.result && res.result.status;
+  return st === 'creator' || st === 'administrator';
+}
 
 async function getStudentAccount(supabaseUrl, supabaseKey, telegramUserId) {
   try {
@@ -408,9 +504,6 @@ async function safeFetchJson(url, options) {
   }
 }
 
-// ── CLEAN GROUP EXPERIENCE: helpers ──
-const EPHEMERAL_MINUTES = 20;
-
 async function tgApi(token, method, body) {
   try {
     const resp = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
@@ -474,52 +567,20 @@ async function saveReceipt(supabaseUrl, supabaseKey, r) {
   return null;
 }
 
-async function registerEphemeral(supabaseUrl, supabaseKey, row) {
-  try {
-    await fetch(`${supabaseUrl}/rest/v1/ubsi_ephemeral_msgs`, {
-      method: 'POST',
-      headers: {
-        'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(row)
-    });
-  } catch (_) {}
-}
-
-async function patchEphemeralJadwal(supabaseUrl, supabaseKey, chatId, messageId, items) {
-  try {
-    await fetch(
-      `${supabaseUrl}/rest/v1/ubsi_ephemeral_msgs?bot=eq.absen&kind=eq.jadwal&chat_id=eq.${chatId}&message_id=eq.${messageId}`,
-      {
-        method: 'PATCH',
-        headers: {
-          'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          payload: { items },
-          expires_at: new Date(Date.now() + EPHEMERAL_MINUTES * 60000).toISOString()
-        })
-      }
-    );
-  } catch (_) {}
-}
-
-// Render list jadwal hidup + hitung mundur live per matkul (zona WIB)
-function renderJadwalText(items, sisaMenit) {
+// Render jadwal untuk DM + hitung mundur live per matkul (zona WIB, saat render)
+function renderJadwalText(items) {
   const HARI_IDX = { "minggu": 0, "senin": 1, "selasa": 2, "rabu": 3, "kamis": 4, "jumat": 5, "jum'at": 5, "sabtu": 6 };
   // "Sekarang" versi WIB
   const nowWib = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Pontianak' }));
   const todayIdx = nowWib.getDay();
 
-  let text = `📋 *JADWAL KULIAH (LIST HIDUP):*\n\n`;
+  let text = `📋 *JADWAL KULIAH KAMU:*\n\n`;
   items.forEach((j, idx) => {
     const sks = j.sks ? ` (${j.sks} SKS)` : "";
     text += `${idx + 1}. *${j.nama}*${sks}\n`;
     text += `   ⏰ ${j.hari || '-'}, ${j.jam || '-'} (Ruang: ${j.ruang || '-'})\n`;
 
-    // Coba parse hari + jam "HH:MM-HH:MM" untuk hitung mundur live
+    // Coba parse hari + jam "HH:MM-HH:MM" untuk hitung mundur
     const dayIdx = HARI_IDX[String(j.hari || '').trim().toLowerCase()];
     const m = String(j.jam || '').match(/(\d{1,2})[:.](\d{2})\s*[-–]\s*(\d{1,2})[:.](\d{2})/);
     if (dayIdx !== undefined && m) {
@@ -546,7 +607,6 @@ function renderJadwalText(items, sisaMenit) {
     text += `\n`;
   });
 
-  text += `⏱ *List hidup* — menguap otomatis dalam ${sisaMenit} menit.\n`;
-  text += `_Tekan 🔄 Perbarui untuk muat jadwal terbaru._`;
+  text += `_Data diambil langsung dari SIAKAD. Cek ulang kapan saja lewat tombol 📋 Cek Jadwal._`;
   return text;
 }
