@@ -7,6 +7,14 @@
  * 4. /materi <kata kunci>   -> Slide/PDF materi MyBest (judul=judul, URL absolut)
  * 5. /tugas                 -> Daftar tugas valid (nama matkul, deadline, status GDrive/MyBest) + tombol soal (short_id)
  * 6. /kumpul <token> <link_gdrive> [catatan] -> Pengumpulan tugas via Google Drive (wajib link)
+ *
+ * V4 "Topik Terkunci" (pola sama dengan Bot Absen V2):
+ * - /pasang (admin) -> menu pin 4 tombol + tutup topik; /buka untuk maintenance
+ * - Semua konten (list/file/hasil cari) -> DM via bot ini; notif gagal/status -> flash 10 detik
+ * - Tombol: gd_materi, gd_matkul_<sid>, dl_mat_<sid>, gd_tugas, gd_buku, gd_riset,
+ *   gd_cari, gd_jurnal, kumpul_btn_<sid> (sid = ubsi_short_map, lihat sql-gudang-short-map.sql)
+ * - Kumpul 2 langkah: klik tombol -> balas DM bot dengan link GDrive (tanpa ketik token)
+ * - Resi KMP tetap + salinan resi ke DM Bot Master (env BOT_TOKEN_MASTER, opsional)
  */
 
 export default {
@@ -23,6 +31,7 @@ export default {
       const supabaseUrl = env.SUPABASE_URL || 'https://wagvbmkimpswiidnenwx.supabase.co';
       const supabaseKey = env.SUPABASE_SERVICE_ROLE_KEY;
       const datacenterChatId = env.DATACENTER_CHAT_ID || '';
+      const masterBotToken = env.BOT_TOKEN_MASTER || '';
 
       // ── 1. TANGANI TOMBOL KLIK (Callback Query) ──
       if (update.callback_query) {
@@ -46,9 +55,14 @@ export default {
           return new Response('OK', { status: 200 });
         }
 
-        if (cbData === "btn_list_tugas") {
+        if (cbData === "btn_list_tugas" || cbData === "gd_tugas") {
           await answerCallback(botToken, query.id, "Mengambil daftar tugas aktif...");
-          await handleListTugas(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey);
+          await handleListTugas(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey, {
+            dmUserId: userId, userName, datacenterChatId, ctx,
+          });
+          if (String(chatId) !== String(userId)) {
+            sendFlash(ctx, botToken, chatId, threadId, `📋 *${userName}*, daftar tugas dikirim ke DM kamu (Bot Gudang).`);
+          }
           return new Response('OK', { status: 200 });
         }
 
@@ -65,6 +79,190 @@ export default {
             return new Response('OK', { status: 200 });
           }
           await handleDownloadFile(botToken, chatId, threadId, acc, backendUrl, apiKey, fileUrl, datacenterChatId, "Soal Tugas");
+          return new Response('OK', { status: 200 });
+        }
+
+        // ── V4: SHORT MAP CALLBACKS (matkul / file materi / kumpul) ──
+        if (cbData.startsWith("gd_matkul_") || cbData.startsWith("dl_mat_") || cbData.startsWith("kumpul_btn_")) {
+          const sid = cbData.replace(/^gd_matkul_|^dl_mat_|^kumpul_btn_/, "");
+          const val = await getShortMap(supabaseUrl, supabaseKey, sid);
+          if (!val) {
+            await answerCallback(botToken, query.id, "Referensi kedaluwarsa — buka ulang menunya ya.");
+            return new Response('OK', { status: 200 });
+          }
+
+          // kumpul_btn_<sid>: kirim prompt kumpul ke DM (balas dengan link GDrive)
+          if (cbData.startsWith("kumpul_btn_")) {
+            await answerCallback(botToken, query.id, "Siap! Lanjut di DM ya.");
+            const prompt =
+              `📤 *KUMPUL TUGAS*\n` +
+              `🔑 Token: \`${val}\`\n\n` +
+              `Balas (reply) pesan ini dengan *link Google Drive* jawabanmu.\n` +
+              `Pastikan akses file *"Anyone with the link"* supaya dosen bisa membuka.`;
+            const dm = await sendTelegram(botToken, userId, prompt);
+            if ((!dm || !dm.ok) && String(chatId) !== String(userId)) {
+              sendFlash(ctx, botToken, chatId, threadId, `⚠️ *${userName}*, aku gak bisa DM kamu. Buka DM Bot Gudang dulu lalu tekan Start.`);
+            }
+            return new Response('OK', { status: 200 });
+          }
+
+          // gd_matkul_<sid>: val = "<token_learning>|||<nama matkul>" -> daftar file materi ke DM
+          if (cbData.startsWith("gd_matkul_")) {
+            await answerCallback(botToken, query.id, "Mengambil daftar materi...");
+            const sep = val.indexOf("|||");
+            const courseToken = sep >= 0 ? val.slice(0, sep) : val;
+            const courseName = sep >= 0 ? val.slice(sep + 3) : "Mata Kuliah";
+
+            const mRes = await safeFetchJson(`${backendUrl}/v1/elearning/materials?token=${encodeURIComponent(courseToken)}`, {
+              headers: {
+                'X-API-Key': apiKey,
+                'X-Elearning-NIM': acc.nim,
+                'X-Elearning-Pass': acc.encrypted_password,
+                'X-Nim': acc.nim,
+                'X-Pass': acc.encrypted_password,
+              }
+            });
+            const files = [];
+            collectFileUrls(mRes.data ? mRes.data.data : null, courseName, files);
+
+            if (files.length === 0) {
+              await sendTelegram(botToken, userId, `📭 Matkul *${courseName}* belum punya file materi di MyBest.`);
+              if (String(chatId) !== String(userId)) {
+                sendFlash(ctx, botToken, chatId, threadId, `📭 Matkul *${courseName}* belum punya materi — info dikirim ke DM.`);
+              }
+              return new Response('OK', { status: 200 });
+            }
+
+            const shown = files.slice(0, 8);
+            const mapped = await saveShortMap(supabaseUrl, supabaseKey, shown.map(f => f.url), "file", userId);
+            const rows = [];
+            shown.forEach((f, i) => {
+              if (mapped[i]) rows.push([{ text: `📄 ${String(f.title).slice(0, 40)}`, callback_data: `dl_mat_${mapped[i].sid}` }]);
+            });
+            const dm = await sendTelegram(botToken, userId, `📚 *${courseName}*\nPilih file materi:`, null, { inline_keyboard: rows });
+            if ((!dm || !dm.ok) && String(chatId) !== String(userId)) {
+              sendFlash(ctx, botToken, chatId, threadId, `⚠️ *${userName}*, aku gak bisa DM kamu. Buka DM Bot Gudang dulu lalu tekan Start.`);
+            }
+            return new Response('OK', { status: 200 });
+          }
+
+          // dl_mat_<sid>: val = URL file -> kirim PDF ke chat tempat tombol berada (DM)
+          await answerCallback(botToken, query.id, "Mengunduh materi...");
+          const ok = await handleDownloadFile(botToken, chatId, threadId, acc, backendUrl, apiKey, val, datacenterChatId, "Materi Kuliah");
+          if (!ok) {
+            await sendTelegram(botToken, chatId, `⚠️ Gagal mengirim file (server kampus sibuk?). Coba lagi sebentar ya.`, threadId);
+          }
+          return new Response('OK', { status: 200 });
+        }
+
+        // ── V4: MENU GUDANG (dari pesan pin / menu DM) ──
+        const originTopic = String(chatId) !== String(userId);
+
+        if (cbData === "gd_materi") {
+          await answerCallback(botToken, query.id, "Mengambil daftar matkul...");
+          const cRes = await safeFetchJson(`${backendUrl}/v1/elearning/courses`, {
+            headers: {
+              'X-API-Key': apiKey,
+              'X-Elearning-NIM': acc.nim,
+              'X-Elearning-Pass': acc.encrypted_password,
+              'X-Nim': acc.nim,
+              'X-Pass': acc.encrypted_password,
+            }
+          });
+          const courses = ((cRes.data && cRes.data.data) || []).filter(c => c.token_learning).slice(0, 8);
+          if (courses.length === 0) {
+            sendFlash(ctx, botToken, chatId, threadId, `📭 Tidak ada matkul aktif dengan materi di MyBest-mu.`);
+            return new Response('OK', { status: 200 });
+          }
+          const mapped = await saveShortMap(
+            supabaseUrl, supabaseKey,
+            courses.map(c => `${c.token_learning}|||${c.nama || c.matakuliah || c.name || c.kode || "Mata Kuliah"}`),
+            "matkul", userId
+          );
+          const rows = [];
+          courses.forEach((c, i) => {
+            if (mapped[i]) {
+              const nama = (c.nama || c.matakuliah || c.name || c.kode || "Mata Kuliah");
+              rows.push([{ text: `📚 ${String(nama).slice(0, 32)}`, callback_data: `gd_matkul_${mapped[i].sid}` }]);
+            }
+          });
+          const dm = await sendTelegram(botToken, userId, `📚 *MATERI KULIAH MYBEST*\nPilih matkul:`, null, { inline_keyboard: rows });
+          if (dm && dm.ok) {
+            if (originTopic) sendFlash(ctx, botToken, chatId, threadId, `📚 *${userName}*, daftar matkul dikirim ke DM kamu.`);
+          } else if (originTopic) {
+            sendFlash(ctx, botToken, chatId, threadId, `⚠️ *${userName}*, aku gak bisa DM kamu. Buka DM Bot Gudang dulu lalu tekan Start.`);
+          }
+          return new Response('OK', { status: 200 });
+        }
+
+        if (cbData === "gd_buku") {
+          await answerCallback(botToken, query.id, "Mode cari buku siap!");
+          const dm = await sendTelegram(botToken, userId,
+            `📖 *CARI BUKU PERPUSTAKAAN*\n\nBalas (reply) pesan ini dengan *judul buku* yang kamu cari.\nContoh: pemrograman web`
+          );
+          if (dm && dm.ok) {
+            if (originTopic) sendFlash(ctx, botToken, chatId, threadId, `📖 *${userName}*, balas pesan di DM dengan judul bukunya.`);
+          } else if (originTopic) {
+            sendFlash(ctx, botToken, chatId, threadId, `⚠️ *${userName}*, aku gak bisa DM kamu. Buka DM Bot Gudang dulu lalu tekan Start.`);
+          }
+          return new Response('OK', { status: 200 });
+        }
+
+        if (cbData === "gd_riset") {
+          await answerCallback(botToken, query.id, "Portal riset siap!");
+          const dm = await sendTelegram(botToken, userId,
+            `🎓 *PORTAL RISET USRC*\nPilih:`,
+            null,
+            { inline_keyboard: [
+              [{ text: "🔍 Cari Skripsi / TA", callback_data: "gd_cari" }],
+              [{ text: "📑 Katalog Jurnal Kampus", callback_data: "gd_jurnal" }],
+            ] }
+          );
+          if (dm && dm.ok) {
+            if (originTopic) sendFlash(ctx, botToken, chatId, threadId, `🎓 *${userName}*, portal riset dikirim ke DM kamu.`);
+          } else if (originTopic) {
+            sendFlash(ctx, botToken, chatId, threadId, `⚠️ *${userName}*, aku gak bisa DM kamu. Buka DM Bot Gudang dulu lalu tekan Start.`);
+          }
+          return new Response('OK', { status: 200 });
+        }
+
+        if (cbData === "gd_cari") {
+          await answerCallback(botToken, query.id, "Mode riset siap!");
+          const dm = await sendTelegram(botToken, userId,
+            `🎓 *CARI SKRIPSI / TA*\n\nBalas (reply) pesan ini dengan *topik penelitian* yang kamu cari.\nContoh: sistem pakar`
+          );
+          if (dm && dm.ok) {
+            if (originTopic) sendFlash(ctx, botToken, chatId, threadId, `🎓 *${userName}*, balas pesan di DM dengan topik risetmu.`);
+          } else if (originTopic) {
+            sendFlash(ctx, botToken, chatId, threadId, `⚠️ *${userName}*, aku gak bisa DM kamu. Buka DM Bot Gudang dulu lalu tekan Start.`);
+          }
+          return new Response('OK', { status: 200 });
+        }
+
+        if (cbData === "gd_jurnal") {
+          await answerCallback(botToken, query.id, "Mengambil katalog jurnal...");
+          try {
+            const res = await fetch(`${backendUrl}/v1/ejournal/journals`, { headers: { 'X-API-Key': apiKey } });
+            const json = await res.json();
+            if (!json.success || !json.data || json.data.length === 0) {
+              await sendTelegram(botToken, userId, `📑 Belum ada katalog jurnal yang terdaftar.`);
+              return new Response('OK', { status: 200 });
+            }
+            const rows = [];
+            json.data.slice(0, 8).forEach(j => {
+              if (j.url && /^https:\/\//i.test(j.url)) {
+                rows.push([{ text: `📑 ${String(j.name || j.title || "Jurnal").slice(0, 32)}`, url: j.url }]);
+              }
+            });
+            const dm = await sendTelegram(botToken, userId, `📑 *KATALOG E-JOURNAL OJS UBSI*\nKlik untuk membuka portal:`, null, { inline_keyboard: rows });
+            if (dm && dm.ok) {
+              if (originTopic) sendFlash(ctx, botToken, chatId, threadId, `📑 *${userName}*, katalog jurnal dikirim ke DM kamu.`);
+            } else if (originTopic) {
+              sendFlash(ctx, botToken, chatId, threadId, `⚠️ *${userName}*, aku gak bisa DM kamu. Buka DM Bot Gudang dulu lalu tekan Start.`);
+            }
+          } catch (err) {
+            sendFlash(ctx, botToken, chatId, threadId, `❌ Gagal mengambil e-journal: ${err.message}`);
+          }
           return new Response('OK', { status: 200 });
         }
 
@@ -152,6 +350,16 @@ export default {
             { inline_keyboard: [[{ text: "🔄 Cek Tugas Lagi", callback_data: "re_tugas" }]] }
           );
 
+          // V4: salinan resi resmi ke DM Bot Master (kalau konfirmasi terjadi di topik)
+          if (masterBotToken && String(chatId) !== String(userId)) {
+            await sendTelegram(masterBotToken, userId,
+              `🧾 *RESI PENGUMPULAN TUGAS*\n` +
+              `📌 *Tugas:* ${row.judul_tugas || row.token_tugas}\n` +
+              (row.is_late ? `⚠️ Status: TERLAMBAT\n` : `✅ Status: TEPAT WAKTU\n`) +
+              (resiCode ? `🧾 *Resi:* \`${resiCode}\` _(verifikasi: /cek ${resiCode})_` : "")
+            ).catch(() => {});
+          }
+
           // Arsip ke DATACENTER USRC
           if (datacenterChatId) {
             await sendTelegram(botToken, datacenterChatId,
@@ -213,6 +421,85 @@ export default {
         return new Response('Ignored out-of-topic message', { status: 200 });
       }
 
+      // ── V4: /pasang (admin) — menu pin + tutup topik ──
+      if (isGroup && text.startsWith('/pasang')) {
+        if (!(await isAdmin(botToken, chatId, userId))) {
+          sendFlash(ctx, botToken, chatId, threadId, `⛔ Perintah ini khusus admin.`);
+          return new Response('OK', { status: 200 });
+        }
+        const sent = await sendTelegram(botToken, chatId, GD_MENU_TEXT, threadId, GD_MENU_KEYBOARD);
+        if (sent && sent.ok && sent.result && sent.result.message_id) {
+          await tgApi(botToken, "pinChatMessage", {
+            chat_id: chatId, message_id: sent.result.message_id, disable_notification: true
+          });
+        }
+        await tgApi(botToken, "closeForumTopic", { chat_id: chatId, message_thread_id: 7 });
+        await ghostLog(supabaseUrl, supabaseKey, datacenterChatId, botToken, {
+          bot: "gudang", chat_id: chatId, thread_id: threadId,
+          user_id: userId, user_name: userName, nim: null,
+          command: "/pasang", detail: "menu gudang dipin + topik ditutup", outcome: "success"
+        });
+        return new Response('OK', { status: 200 });
+      }
+
+      // ── V4: /buka (admin) — buka topik untuk maintenance ──
+      if (isGroup && text.startsWith('/buka')) {
+        if (!(await isAdmin(botToken, chatId, userId))) {
+          sendFlash(ctx, botToken, chatId, threadId, `⛔ Perintah ini khusus admin.`);
+          return new Response('OK', { status: 200 });
+        }
+        await tgApi(botToken, "reopenForumTopic", { chat_id: chatId, message_thread_id: 7 });
+        await ghostLog(supabaseUrl, supabaseKey, datacenterChatId, botToken, {
+          bot: "gudang", chat_id: chatId, thread_id: threadId,
+          user_id: userId, user_name: userName, nim: null,
+          command: "/buka", detail: "topik gudang dibuka", outcome: "success"
+        });
+        return new Response('OK', { status: 200 });
+      }
+
+      // ── V4: REPLY FLOW DI DM (kumpul via link, cari buku, cari skripsi) ──
+      const rep = msg.reply_to_message;
+      if (!isGroup && rep && rep.from && rep.from.is_bot && rep.text) {
+        const rt = rep.text;
+
+        // Balasan prompt kumpul: ambil token dari pesan prompt, validasi link
+        if (rt.includes("KUMPUL TUGAS")) {
+          const tm = rt.match(/🔑\s*Token:\s*`?([A-Za-z0-9._-]+)`?/);
+          const link = text;
+          if (tm && /^https:\/\/(drive|docs)\.google\.com\//i.test(link)) {
+            const acc = await getStudentAccount(supabaseUrl, supabaseKey, userId);
+            if (!acc) {
+              await sendTelegram(botToken, chatId, "🔒 Akun MyBest belum terhubung. Login dulu di DM *Bot Master*.");
+              return new Response('OK', { status: 200 });
+            }
+            // Jalur sama dengan /kumpul: preview + konfirmasi, jejak command dibersihkan otomatis
+            await handleKumpulGDrive(botToken, chatId, null, acc, backendUrl, apiKey, supabaseUrl, supabaseKey,
+              `/kumpul ${tm[1]} ${link}`, userName, datacenterChatId, msg.message_id);
+            return new Response('OK', { status: 200 });
+          }
+          if (tm) {
+            await sendTelegram(botToken, chatId,
+              `⚠️ *Link tidak valid!* Kirim link langsung Google Drive (\`https://drive.google.com/...\`)\nJangan lupa akses *"Anyone with the link"*.`
+            );
+            return new Response('OK', { status: 200 });
+          }
+        }
+
+        // Balasan prompt cari buku (OPAC publik — tanpa perlu akun MyBest)
+        if (rt.includes("CARI BUKU") && text) {
+          const lm = await sendTelegram(botToken, chatId, `📚 Mencari buku "${text.slice(0, 60)}" di OPAC...`);
+          await bukuSearchCore(backendUrl, apiKey, botToken, chatId, null, text, lm && lm.result ? lm.result.message_id : null);
+          return new Response('OK', { status: 200 });
+        }
+
+        // Balasan prompt cari skripsi (repositori publik — tanpa perlu akun MyBest)
+        if (rt.includes("CARI SKRIPSI") && text) {
+          const lm = await sendTelegram(botToken, chatId, `🎓 Mencari riset "${text.slice(0, 60)}" di repositori...`);
+          await cariSearchCore(backendUrl, apiKey, botToken, chatId, null, text, lm && lm.result ? lm.result.message_id : null);
+          return new Response('OK', { status: 200 });
+        }
+      }
+
       // ── A. PERINTAH KUMPUL TUGAS VIA GOOGLE DRIVE ──
       if (text.startsWith('/kumpul')) {
         const acc = await getStudentAccount(supabaseUrl, supabaseKey, userId);
@@ -245,7 +532,7 @@ export default {
 
         // Personal ke DM; command + loading dihapus saat berhasil (lihat handleListTugas)
         await runTugasPersonal(botToken, chatId, threadId, acc, backendUrl, apiKey, supabaseUrl, supabaseKey, datacenterChatId, {
-          userName, userId, cmdMsgId: msg.message_id, srcMessageId: null
+          userName, userId, cmdMsgId: msg.message_id, srcMessageId: null, ctx
         });
         return new Response('OK', { status: 200 });
       }
@@ -258,30 +545,7 @@ export default {
           return new Response('OK', { status: 200 });
         }
 
-        try {
-          const res = await fetch(`${backendUrl}/v1/elibrary/search?q=${encodeURIComponent(query)}`, {
-            headers: { 'X-API-Key': apiKey }
-          });
-          const json = await res.json();
-
-          if (!json.success || !json.data || json.data.length === 0) {
-            await sendTelegram(botToken, chatId, `⚠️ Tidak ditemukan buku untuk kata kunci "${query}".`, threadId);
-            return new Response('OK', { status: 200 });
-          }
-
-          let out = `📚 *KATALOG OPAC PERPUSTAKAAN BSI:*\n\n`;
-          json.data.slice(0, 5).forEach((b, idx) => {
-            out += `${idx + 1}. *${b.title}*\n`;
-            if (b.author) out += `   ✍️ ${b.author}\n`;
-            if (b.year) out += `   📅 ${b.year}\n`;
-            if (b.url) out += `   🔗 [Buka Katalog](${b.url})\n\n`;
-          });
-
-          await sendTelegram(botToken, chatId, out, threadId);
-        } catch (err) {
-          await sendTelegram(botToken, chatId, `❌ Gagal menghubungi perpustakaan: ${err.message}`, threadId);
-        }
-
+        await bukuSearchCore(backendUrl, apiKey, botToken, chatId, threadId, query, null, { dmUserId: userId, userName, ctx });
         return new Response('OK', { status: 200 });
       }
 
@@ -293,35 +557,7 @@ export default {
           return new Response('OK', { status: 200 });
         }
 
-        await sendTelegram(botToken, chatId, `🔍 Mencari repositori riset: "${query}"...`, threadId);
-
-        try {
-          const res = await fetch(`${backendUrl}/v1/repository/search?q=${encodeURIComponent(query)}`, {
-            headers: { 'X-API-Key': apiKey }
-          });
-          const json = await res.json();
-
-          if (!json.success || !json.data || json.data.length === 0) {
-            await sendTelegram(botToken, chatId, `⚠️ Tidak ditemukan dokumen riset untuk kata kunci "${query}".`, threadId);
-            return new Response('OK', { status: 200 });
-          }
-
-          const items = json.data.slice(0, 5);
-          let out = `🎓 *REPOSITORI KAMPUS UBSI:*\n\n`;
-
-          items.forEach((r, idx) => {
-            out += `${idx + 1}. *${r.title}*\n`;
-            if (r.author) out += `   👤 ${r.author}\n`;
-            if (r.year) out += `   📅 ${r.year}\n`;
-            if (r.url) out += `   📄 [Buka Dokumen](${r.url})\n\n`;
-          });
-
-          await sendTelegram(botToken, chatId, out, threadId);
-
-        } catch (err) {
-          await sendTelegram(botToken, chatId, `❌ Gagal menghubungi repositori kampus: ${err.message}`, threadId);
-        }
-
+        await cariSearchCore(backendUrl, apiKey, botToken, chatId, threadId, query, null, { dmUserId: userId, userName, ctx });
         return new Response('OK', { status: 200 });
       }
 
@@ -441,7 +677,12 @@ export default {
         const replyMarkup = {
           inline_keyboard: [
             [
-              { text: "📝 Daftar Tugas Aktif", callback_data: "btn_list_tugas" }
+              { text: "📚 Materi", callback_data: "gd_materi" },
+              { text: "📝 Tugas", callback_data: "gd_tugas" }
+            ],
+            [
+              { text: "📖 Buku", callback_data: "gd_buku" },
+              { text: "🎓 Riset", callback_data: "gd_riset" }
             ]
           ]
         };
@@ -521,7 +762,7 @@ async function handleListTugas(botToken, chatId, threadId, acc, backendUrl, apiK
       if (opts.dmUserId) {
         const dm = await sendTelegram(botToken, opts.dmUserId, emptyText);
         if (dm && dm.ok) {
-          await sendTelegram(botToken, chatId, `📋 *${opts.userName || "Kamu"}*, tidak ada tugas aktif — detail dikirim ke DM kamu.`, threadId);
+          sendFlash(opts.ctx, botToken, chatId, threadId, `📋 *${opts.userName || "Kamu"}*, tidak ada tugas aktif — detail dikirim ke DM kamu.`);
           await ghostLog(supabaseUrl, supabaseKey, opts.datacenterChatId, botToken, {
             bot: "gudang", chat_id: chatId, thread_id: threadId,
             user_id: opts.dmUserId, user_name: opts.userName, nim: acc.nim,
@@ -559,6 +800,17 @@ async function handleListTugas(botToken, chatId, threadId, acc, backendUrl, apiK
       if (mapRes.ok && mapRes.data?.data?.map) soalMap = mapRes.data.data.map;
     }
 
+    // V4: token tugas yang belum dikumpul -> short map (tombol kumpul 2 langkah)
+    const kumpulTokens = enriched
+      .filter(t => !t.doneGDrive && !t.doneMyBest && t.token_tugas)
+      .map(t => t.token_tugas)
+      .slice(0, 6);
+    let kumpulSidMap = {};
+    if (kumpulTokens.length > 0) {
+      const kMap = await saveShortMap(supabaseUrl, supabaseKey, kumpulTokens, "kumpul", opts.dmUserId || null);
+      kMap.forEach(e => { kumpulSidMap[e.val] = e.sid; });
+    }
+
     let out = `📝 *DAFTAR TUGAS E-LEARNING AKTIF (${enriched.length} Tugas)*\n━━━━━━━━━━━━━━━━━━━━\n\n`;
     const keyboardRows = [];
 
@@ -587,14 +839,14 @@ async function handleListTugas(botToken, chatId, threadId, acc, backendUrl, apiK
 
       const sid = soalMap[t.file_soal_url];
       if (sid) keyboardRows.push([{ text: `📥 Soal #${i + 1}`, callback_data: `dl_soal_${sid}` }]);
+      const ks = kumpulSidMap[t.token_tugas];
+      if (ks) keyboardRows.push([{ text: `📤 Kumpul #${i + 1}`, callback_data: `kumpul_btn_${ks}` }]);
     });
 
     out += `━━━━━━━━━━━━━━━━━━━━\n` +
-           `📤 *Cara Kumpul Tugas (via Google Drive):*\n` +
-           `1️⃣ Upload jawaban ke Google Drive kamu\n` +
-           `2️⃣ Set akses *"Anyone with the link"*\n` +
-           `3️⃣ Ketik: \`/kumpul <token> <link_gdrive> [catatan]\`\n\n` +
-           `_Contoh:_\n\`/kumpul ${enriched[0].token_tugas || "TOKEN123"} https://drive.google.com/file/d/... tugas pertemuan 1\` 🤍`;
+           `📤 *Cara Kumpul Tugas:*\n` +
+           `Klik tombol 📤 *Kumpul* di atas, lalu balas DM bot dengan link Google Drive jawabanmu (akses *"Anyone with the link"*).\n` +
+           `_Atau tetap bisa manual:_ \`/kumpul <token> <link> [catatan]\` 🤍`;
 
     keyboardRows.push([{ text: "🔁 Muat Ulang", callback_data: "re_tugas" }]);
     const replyMarkup = { inline_keyboard: keyboardRows };
@@ -1040,4 +1292,183 @@ async function runTugasPersonal(botToken, chatId, threadId, acc, backendUrl, api
     dmUserId: opts.dmUserId || opts.userId || null,
     datacenterChatId
   });
+}
+
+// ── V4 HELPERS ──
+
+// FLASH 10 DETIK: kirim status singkat lalu auto-delete (ctx.waitUntil)
+const FLASH_SECONDS = 10;
+
+function sendFlash(ctx, token, chatId, threadId, text) {
+  return sendTelegram(token, chatId, text, threadId).then(sent => {
+    const msgId = sent && sent.result && sent.result.message_id;
+    if (msgId) {
+      const job = new Promise(r => setTimeout(r, FLASH_SECONDS * 1000))
+        .then(() => deleteMessage(token, chatId, msgId));
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(job);
+    }
+    return sent;
+  });
+}
+
+async function isAdmin(token, chatId, userId) {
+  if (!userId) return false;
+  const res = await tgApi(token, "getChatMember", { chat_id: chatId, user_id: userId });
+  const st = res && res.result && res.result.status;
+  return st === 'creator' || st === 'administrator';
+}
+
+// SHORT MAP: token/URL panjang -> short_id 10 hex (tabel ubsi_short_map, TTL 24 jam)
+function genSid() {
+  const buf = new Uint8Array(5);
+  crypto.getRandomValues(buf);
+  let s = "";
+  for (const b of buf) s += b.toString(16).padStart(2, "0");
+  return s;
+}
+
+async function saveShortMap(supabaseUrl, supabaseKey, vals, kind, userId) {
+  const now = Date.now();
+  const rows = (vals || []).slice(0, 8).map(v => ({
+    sid: genSid(), val: String(v), kind,
+    user_id: userId || null,
+    expires_at: new Date(now + 24 * 3600 * 1000).toISOString()
+  }));
+  // bersihkan yang kedaluwarsa (opportunistic, biar tabel tetap kurus)
+  fetch(`${supabaseUrl}/rest/v1/ubsi_short_map?expires_at=lt.${new Date(now).toISOString()}`, {
+    method: 'DELETE',
+    headers: { 'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}` }
+  }).catch(() => {});
+  if (rows.length === 0) return [];
+  try {
+    await fetch(`${supabaseUrl}/rest/v1/ubsi_short_map`, {
+      method: 'POST',
+      headers: {
+        'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}`,
+        'Content-Type': 'application/json',
+        'Prefer': 'resolution=ignore-duplicates'
+      },
+      body: JSON.stringify(rows)
+    });
+  } catch (_) {}
+  return rows.map(r => ({ sid: r.sid, val: r.val }));
+}
+
+async function getShortMap(supabaseUrl, supabaseKey, sid) {
+  try {
+    const res = await safeFetchJson(
+      `${supabaseUrl}/rest/v1/ubsi_short_map?sid=eq.${encodeURIComponent(sid)}&select=val,expires_at`,
+      { headers: { 'apikey': supabaseKey, 'Authorization': `Bearer ${supabaseKey}` } }
+    );
+    const row = Array.isArray(res.data) ? res.data[0] : null;
+    if (!row) return null;
+    if (row.expires_at && new Date(row.expires_at).getTime() < Date.now()) return null;
+    return row.val;
+  } catch (_) {
+    return null;
+  }
+}
+
+// MENU PIN GUDANG (4 tombol)
+const GD_MENU_TEXT =
+  "📚 *GUDANG MATERI & RUANG TUGAS USRC*\n\n" +
+  "Topik ini terkunci — cukup tekan tombol:\n" +
+  "• List, file & hasil cari dikirim ke *DM bot ini*\n" +
+  "• Notif gagal/status muncul 10 detik lalu terhapus sendiri";
+
+const GD_MENU_KEYBOARD = {
+  inline_keyboard: [
+    [
+      { text: "📚 Materi", callback_data: "gd_materi" },
+      { text: "📝 Tugas", callback_data: "gd_tugas" }
+    ],
+    [
+      { text: "📖 Buku", callback_data: "gd_buku" },
+      { text: "🎓 Riset", callback_data: "gd_riset" }
+    ]
+  ]
+};
+
+// CORE: cari buku OPAC (publik) — hasil teks + tombol URL ke DM
+async function bukuSearchCore(backendUrl, apiKey, botToken, chatId, threadId, query, loadingMsgId, opts = {}) {
+  const target = opts.dmUserId || chatId;
+  try {
+    const res = await fetch(`${backendUrl}/v1/elibrary/search?q=${encodeURIComponent(query)}`, {
+      headers: { 'X-API-Key': apiKey }
+    });
+    const json = await res.json();
+    if (loadingMsgId) await deleteMessage(botToken, chatId, loadingMsgId);
+
+    if (!json.success || !json.data || json.data.length === 0) {
+      const msg = `⚠️ Tidak ditemukan buku untuk kata kunci "${query}".`;
+      await sendTelegram(botToken, target, msg);
+      if (target !== chatId) sendFlash(opts.ctx, botToken, chatId, threadId, msg);
+      return;
+    }
+
+    const rows = [];
+    let out = `📚 *KATALOG OPAC PERPUSTAKAAN BSI:*\n\n`;
+    json.data.slice(0, 5).forEach((b, idx) => {
+      out += `${idx + 1}. *${b.title}*\n`;
+      if (b.author) out += `   ✍️ ${b.author}\n`;
+      if (b.year) out += `   📅 ${b.year}\n`;
+      out += `\n`;
+      if (b.url && /^https:/i.test(b.url)) {
+        rows.push([{ text: `📖 ${String(b.title).slice(0, 30)}`, url: b.url }]);
+      }
+    });
+    out += `_Klik tombol untuk membuka katalog buku._`;
+
+    const sent = await sendTelegram(botToken, target, out, null, rows.length ? { inline_keyboard: rows } : null);
+    if (sent && sent.ok && target !== chatId) {
+      sendFlash(opts.ctx, botToken, chatId, threadId, `📚 *${opts.userName || "Kamu"}*, hasil pencarian buku dikirim ke DM kamu.`);
+    } else if ((!sent || !sent.ok) && target !== chatId) {
+      sendFlash(opts.ctx, botToken, chatId, threadId, `⚠️ *${opts.userName || "Kamu"}*, aku gak bisa DM kamu. Buka DM Bot Gudang dulu lalu tekan Start.`);
+    }
+  } catch (err) {
+    if (loadingMsgId) await deleteMessage(botToken, chatId, loadingMsgId);
+    await sendTelegram(botToken, chatId, `❌ Gagal menghubungi perpustakaan: ${err.message}`, threadId);
+  }
+}
+
+// CORE: cari skripsi/TA EPrints (publik) — hasil teks + tombol URL ke DM
+async function cariSearchCore(backendUrl, apiKey, botToken, chatId, threadId, query, loadingMsgId, opts = {}) {
+  const target = opts.dmUserId || chatId;
+  try {
+    const res = await fetch(`${backendUrl}/v1/repository/search?q=${encodeURIComponent(query)}`, {
+      headers: { 'X-API-Key': apiKey }
+    });
+    const json = await res.json();
+    if (loadingMsgId) await deleteMessage(botToken, chatId, loadingMsgId);
+
+    if (!json.success || !json.data || json.data.length === 0) {
+      const msg = `⚠️ Tidak ditemukan dokumen riset untuk kata kunci "${query}".`;
+      await sendTelegram(botToken, target, msg);
+      if (target !== chatId) sendFlash(opts.ctx, botToken, chatId, threadId, msg);
+      return;
+    }
+
+    const rows = [];
+    let out = `🎓 *REPOSITORI KAMPUS UBSI:*\n\n`;
+    json.data.slice(0, 5).forEach((r, idx) => {
+      out += `${idx + 1}. *${r.title}*\n`;
+      if (r.author) out += `   👤 ${r.author}\n`;
+      if (r.year) out += `   📅 ${r.year}\n`;
+      out += `\n`;
+      if (r.url && /^https:/i.test(r.url)) {
+        rows.push([{ text: `📄 ${String(r.title).slice(0, 30)}`, url: r.url }]);
+      }
+    });
+    out += `_Klik tombol untuk membuka dokumen._`;
+
+    const sent = await sendTelegram(botToken, target, out, null, rows.length ? { inline_keyboard: rows } : null);
+    if (sent && sent.ok && target !== chatId) {
+      sendFlash(opts.ctx, botToken, chatId, threadId, `🎓 *${opts.userName || "Kamu"}*, hasil riset dikirim ke DM kamu.`);
+    } else if ((!sent || !sent.ok) && target !== chatId) {
+      sendFlash(opts.ctx, botToken, chatId, threadId, `⚠️ *${opts.userName || "Kamu"}*, aku gak bisa DM kamu. Buka DM Bot Gudang dulu lalu tekan Start.`);
+    }
+  } catch (err) {
+    if (loadingMsgId) await deleteMessage(botToken, chatId, loadingMsgId);
+    await sendTelegram(botToken, chatId, `❌ Gagal menghubungi repositori kampus: ${err.message}`, threadId);
+  }
 }
