@@ -102,7 +102,16 @@ export default {
 
               // Grup tetap BERSIH: sukses hanya dikirim ke DM via Bot Master
               let dmOk = false;
-              if (masterBotToken) {
+              let dmErr = "";
+              if (!masterBotToken) {
+                dmErr = "env BOT_TOKEN_MASTER belum diset di worker absen";
+                await sendFlash(
+                  ctx, botToken, chatId, threadId,
+                  `✅ *Presensi ${userName} BERHASIL* — matkul *${mkName}*` +
+                  (resiCode ? `\n🧾 Resi: \`${resiCode}\`` : "") +
+                  `\n⚙️ Pengiriman bukti ke DM belum terkonfigurasi — lapor admin ya (resimu tetap tercatat, verifikasi: /cek ${resiCode || "-"}).`
+                );
+              } else {
                 const dm = await sendTelegram(
                   masterBotToken,
                   userId,
@@ -116,23 +125,23 @@ export default {
                   `\nStatus kehadiranmu sudah tercatat resmi di portal MyBest kampus! 🤍`
                 );
                 dmOk = !!(dm && dm.ok);
-              }
-
-              if (!dmOk) {
-                // DM gagal (belum Start Bot Master / diblokir) → flash 10 dtk di topik
-                await sendFlash(
-                  ctx, botToken, chatId, threadId,
-                  `✅ *Presensi ${userName} BERHASIL* — matkul *${mkName}*` +
-                  (resiCode ? `\n🧾 Resi: \`${resiCode}\`` : "") +
-                  `\n⚠️ Bukti lengkap gagal dikirim ke DM. Buka DM Bot Master lalu tekan Start.`
-                );
+                if (!dmOk) dmErr = dm ? `Telegram: ${dm.description || "unknown"}` : "fetch error";
+                if (!dmOk) {
+                  // DM gagal (belum Start Bot Master / diblokir) → flash 10 dtk di topik
+                  await sendFlash(
+                    ctx, botToken, chatId, threadId,
+                    `✅ *Presensi ${userName} BERHASIL* — matkul *${mkName}*` +
+                    (resiCode ? `\n🧾 Resi: \`${resiCode}\`` : "") +
+                    `\n⚠️ Bukti lengkap gagal dikirim ke DM. Buka DM Bot Master lalu tekan Start.`
+                  );
+                }
               }
 
               await ghostLog(supabaseUrl, supabaseKey, botToken, {
                 bot: "absen", chat_id: chatId, thread_id: threadId,
                 user_id: userId, user_name: acc.full_name || userName, nim: acc.nim,
                 command: "btn_absen_now",
-                detail: `presensi "${mkName}" (${dosen}) — resi ${resiCode || "-"} → DM master ${dmOk ? "terkirim" : "GAGAL"}`,
+                detail: `presensi "${mkName}" (${dosen}) — resi ${resiCode || "-"} → DM master ${dmOk ? "terkirim" : `GAGAL (${dmErr})`}`,
                 outcome: "success"
               });
             } else {
@@ -205,23 +214,28 @@ export default {
 
             // Kirim ke DM mahasiswa via Bot Master (grup tetap bersih)
             let dmOk = false;
-            if (masterBotToken) {
+            let dmErr = "";
+            if (!masterBotToken) {
+              dmErr = "env BOT_TOKEN_MASTER belum diset di worker absen";
+              sendFlash(ctx, botToken, chatId, threadId,
+                `⚙️ *${userName}*, pengiriman DM belum terkonfigurasi — lapor admin ya (jadwal berhasil diambil tapi gak bisa dikirim).`);
+            } else {
               const dm = await sendTelegram(masterBotToken, userId, renderJadwalText(items));
               dmOk = !!(dm && dm.ok);
-            }
-
-            if (!dmOk) {
-              await sendFlash(
-                ctx, botToken, chatId, threadId,
-                `⚠️ *${userName}*, jadwal gagal dikirim ke DM.\nBuka DM Bot Master dulu lalu tekan Start, setelah itu coba lagi.`
-              );
+              if (!dmOk) dmErr = dm ? `Telegram: ${dm.description || "unknown"}` : "fetch error";
+              if (!dmOk) {
+                await sendFlash(
+                  ctx, botToken, chatId, threadId,
+                  `⚠️ *${userName}*, jadwal gagal dikirim ke DM.\nBuka DM Bot Master dulu lalu tekan Start, setelah itu coba lagi.`
+                );
+              }
             }
 
             await ghostLog(supabaseUrl, supabaseKey, botToken, {
               bot: "absen", chat_id: chatId, thread_id: threadId,
               user_id: userId, user_name: userName, nim: acc.nim,
               command: "btn_jadwal_today",
-              detail: `${items.length} jadwal → DM master ${dmOk ? "terkirim" : "GAGAL"}`,
+              detail: `${items.length} jadwal → DM master ${dmOk ? "terkirim" : `GAGAL (${dmErr})`}`,
               outcome: dmOk ? "success" : "failed"
             });
           } catch (err) {
